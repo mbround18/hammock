@@ -15,7 +15,7 @@ const WHISPER_SAMPLE_RATE: u32 = 16_000;
 pub struct TranscriptionJob {
     pub channel_id: ChannelId,
     pub guild_id: GuildId,
-    pub speaker_id: UserId,
+    pub speaker_id: Option<UserId>,
     pub speaker_name: String,
     pub pcm: Vec<i16>,
     pub sample_rate: u32,

@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -17,12 +20,17 @@ use songbird::{
         payload::{ClientDisconnect, Speaking},
     },
 };
-use tokio::sync::{Mutex, watch};
+use tokio::{
+    sync::{Mutex, watch},
+    task,
+};
 use tracing::{debug, error};
 
 use crate::{
+    caption_sink_json::CaptionSink,
     discord_utils::resolve_user_name,
     transcription::{TranscriptionHandle, TranscriptionJob},
+    voice_roster::VoiceRoster,
 };
 
 pub struct CaptionPipelineConfig {
@@ -33,6 +41,9 @@ pub struct CaptionPipelineConfig {
     pub transcriber: TranscriptionHandle,
     pub speaker_updates: Option<SpeakerUpdateSender>,
     pub ctx: Context,
+    pub caption_sink: Arc<CaptionSink>,
+    pub silence_flush: Duration,
+    pub roster: Arc<VoiceRoster>,
 }
 
 pub async fn attach_caption_pipeline(
@@ -47,6 +58,9 @@ pub async fn attach_caption_pipeline(
         transcriber,
         speaker_updates,
         ctx,
+        caption_sink,
+        silence_flush,
+        roster,
     } = config;
 
     let aggregator = Arc::new(AudioAggregator::new(
@@ -57,6 +71,9 @@ pub async fn attach_caption_pipeline(
         transcriber,
         speaker_updates,
         ctx,
+        caption_sink,
+        silence_flush,
+        roster,
     ));
 
     let handler = CaptionReceiver::new(Arc::clone(&aggregator));
@@ -113,14 +130,17 @@ struct AudioAggregator {
     transcriber: TranscriptionHandle,
     ssrc_map: DashMap<u32, UserId>,
     buffers: DashMap<u32, AudioBuffer>,
-    pending_audio: DashMap<u32, PendingAudio>,
+    placeholder_labels: DashMap<u32, String>,
     speaker_updates: Option<SpeakerUpdateSender>,
     current_speaker: Mutex<Option<UserId>>,
+    caption_sink: Arc<CaptionSink>,
+    silence_flush: Duration,
+    roster: Arc<VoiceRoster>,
 }
 
 struct AudioBuffer {
     samples: Vec<i16>,
-    speaker: UserId,
+    speaker: SpeakerIdentity,
     last_activity: Instant,
 }
 
@@ -133,6 +153,9 @@ impl AudioAggregator {
         transcriber: TranscriptionHandle,
         speaker_updates: Option<SpeakerUpdateSender>,
         ctx: Context,
+        caption_sink: Arc<CaptionSink>,
+        silence_flush: Duration,
+        roster: Arc<VoiceRoster>,
     ) -> Self {
         Self {
             ctx,
@@ -143,9 +166,12 @@ impl AudioAggregator {
             transcriber,
             ssrc_map: DashMap::new(),
             buffers: DashMap::new(),
-            pending_audio: DashMap::new(),
+            placeholder_labels: DashMap::new(),
             speaker_updates,
             current_speaker: Mutex::new(None),
+            caption_sink,
+            silence_flush,
+            roster,
         }
     }
 
@@ -161,7 +187,9 @@ impl AudioAggregator {
                 "[DIAG] on_speaking: mapped ssrc {} to user {:?}",
                 speaking.ssrc, serenity_id
             );
-            self.promote_pending_audio(speaking.ssrc, serenity_id).await;
+            if let Some((_, label)) = self.placeholder_labels.remove(&speaking.ssrc) {
+                self.relabel_placeholder_entries(label, serenity_id).await;
+            }
         } else {
             debug!("[DIAG] on_speaking: no user_id for ssrc {}", speaking.ssrc);
         }
@@ -178,11 +206,8 @@ impl AudioAggregator {
             if let Some(user_id) = self.resolve_speaking_user(speaking) {
                 self.set_current_speaker(user_id).await;
             }
-        } else {
-            self.flush_stream(speaking.ssrc).await;
-            if let Some(user_id) = self.resolve_speaking_user(speaking) {
-                self.clear_current_speaker(user_id).await;
-            }
+        } else if let Some(user_id) = self.resolve_speaking_user(speaking) {
+            self.clear_current_speaker(user_id).await;
         }
 
         None
@@ -226,102 +251,77 @@ impl AudioAggregator {
     }
 
     async fn push_samples(&self, ssrc: u32, samples: &[i16]) {
-        if let Some(user_id) = self.lookup_user(ssrc) {
-            self.consume_samples(ssrc, user_id, samples).await;
-        } else {
-            debug!("[AUDIO] unknown ssrc {}, buffering audio", ssrc);
-            self.buffer_pending(ssrc, samples);
-        }
+        let identity = self.resolve_identity(ssrc, None).await;
+        self.consume_samples(ssrc, identity, samples).await;
     }
 
-    async fn consume_samples(&self, ssrc: u32, user_id: UserId, samples: &[i16]) {
+    async fn consume_samples(&self, ssrc: u32, identity: SpeakerIdentity, samples: &[i16]) {
         if samples.is_empty() {
             return;
         }
 
         debug!(
-            "[AUDIO] Received {} samples for user {:?}",
+            "[AUDIO] Received {} samples for ssrc {}",
             samples.len(),
-            user_id
+            ssrc
         );
         let mut chunks = Vec::new();
         {
             let mut entry = self
                 .buffers
                 .entry(ssrc)
-                .or_insert_with(|| AudioBuffer::new(user_id));
+                .or_insert_with(|| AudioBuffer::new(identity.clone()));
 
-            entry.speaker = user_id;
+            entry.speaker = identity.clone();
             entry.samples.extend_from_slice(samples);
             entry.last_activity = Instant::now();
 
             while entry.samples.len() >= self.chunk_samples {
                 let chunk: Vec<i16> = entry.samples.drain(..self.chunk_samples).collect();
                 debug!(
-                    "[AUDIO] Chunk ready for transcription: {} samples for user {:?}",
+                    "[AUDIO] Chunk ready for transcription: {} samples for ssrc {}",
                     chunk.len(),
-                    user_id
+                    ssrc
                 );
                 chunks.push(chunk);
             }
         }
 
         for chunk in chunks {
-            self.dispatch_chunk(user_id, chunk).await;
+            self.dispatch_chunk(identity.clone(), chunk).await;
         }
     }
 
-    fn buffer_pending(&self, ssrc: u32, samples: &[i16]) {
+    async fn dispatch_chunk(&self, identity: SpeakerIdentity, samples: Vec<i16>) {
         if samples.is_empty() {
+            debug!("[TRANSCRIBE] Empty chunk, skipping");
             return;
         }
 
-        let mut entry = self
-            .pending_audio
-            .entry(ssrc)
-            .or_insert_with(PendingAudio::new);
-        entry.samples.extend_from_slice(samples);
-    }
+        debug!("[TRANSCRIBE] Dispatching chunk: {} samples", samples.len());
 
-    async fn promote_pending_audio(&self, ssrc: u32, user_id: UserId) {
-        if let Some((_, pending)) = self.pending_audio.remove(&ssrc) {
-            let PendingAudio { samples, .. } = pending;
-            if samples.is_empty() {
-                return;
+        let (speaker_id, speaker_name) = match identity.clone() {
+            SpeakerIdentity::Known(user_id) => {
+                self.set_current_speaker(user_id).await;
+                let name = resolve_user_name(&self.ctx, user_id).await;
+                (Some(user_id), name)
             }
-            debug!(
-                "[AUDIO] Promoting {} buffered samples for user {:?}",
-                samples.len(),
-                user_id
-            );
-            self.consume_samples(ssrc, user_id, &samples).await;
-        }
-    }
-
-    async fn dispatch_chunk(&self, speaker: UserId, samples: Vec<i16>) {
-        if samples.is_empty() {
-            debug!("[TRANSCRIBE] Empty chunk for user {:?}, skipping", speaker);
-            return;
-        }
-
-        debug!(
-            "[TRANSCRIBE] Dispatching chunk for user {:?}: {} samples",
-            speaker,
-            samples.len()
-        );
-        self.set_current_speaker(speaker).await;
-
-        let name = resolve_user_name(&self.ctx, speaker).await;
+            SpeakerIdentity::Placeholder { label } => (None, label),
+        };
 
         let job = TranscriptionJob {
             channel_id: self.channel_id,
             guild_id: self.guild_id,
-            speaker_id: speaker,
-            speaker_name: name,
+            speaker_id,
+            speaker_name,
             pcm: samples,
             sample_rate: self.sample_rate,
             started_at: Utc::now(),
         };
+
+        if let Some(user_id) = job.speaker_id {
+            self.roster.note_spoke(user_id).await;
+        }
 
         let speaker_id = job.speaker_id;
         if let Err(err) = self.transcriber.submit(job).await {
@@ -339,25 +339,28 @@ impl AudioAggregator {
             && !entry.samples.is_empty()
         {
             let samples = entry.samples.split_off(0);
+            let identity = self
+                .resolve_identity(ssrc, Some(entry.speaker.clone()))
+                .await;
             debug!(
-                "[AUDIO] Flushing stream for ssrc {}: {} samples for user {:?}",
+                "[AUDIO] Flushing stream for ssrc {}: {} samples",
                 ssrc,
                 samples.len(),
-                entry.speaker
             );
-            self.dispatch_chunk(entry.speaker, samples).await;
+            self.dispatch_chunk(identity, samples).await;
         }
     }
 
     async fn flush_expired(&self, ssrc: u32) {
         if let Some(mut guard) = self.buffers.get_mut(&ssrc) {
             let should_flush =
-                guard.last_activity.elapsed().as_secs_f32() > 1.0 && !guard.samples.is_empty();
+                guard.last_activity.elapsed() > self.silence_flush && !guard.samples.is_empty();
             if should_flush {
-                let speaker = guard.speaker;
                 let samples = guard.samples.split_off(0);
+                let speaker = guard.speaker.clone();
                 drop(guard);
-                self.dispatch_chunk(speaker, samples).await;
+                let identity = self.resolve_identity(ssrc, Some(speaker)).await;
+                self.dispatch_chunk(identity, samples).await;
             }
         }
     }
@@ -365,10 +368,77 @@ impl AudioAggregator {
     fn lookup_user(&self, ssrc: u32) -> Option<UserId> {
         self.ssrc_map.get(&ssrc).map(|entry| *entry.value())
     }
+
+    fn placeholder_label(&self, ssrc: u32) -> String {
+        if let Some(existing) = self.placeholder_labels.get(&ssrc) {
+            existing.clone()
+        } else {
+            let label = format!("Speaker {ssrc}");
+            self.placeholder_labels.insert(ssrc, label.clone());
+            label
+        }
+    }
+
+    async fn resolve_identity(
+        &self,
+        ssrc: u32,
+        existing: Option<SpeakerIdentity>,
+    ) -> SpeakerIdentity {
+        if let Some(SpeakerIdentity::Known(user_id)) = existing.clone() {
+            return SpeakerIdentity::Known(user_id);
+        }
+
+        if let Some(user_id) = self.lookup_user(ssrc) {
+            return SpeakerIdentity::Known(user_id);
+        }
+
+        if let Some(user_id) = self.roster.guess_speaker(self.channel_id).await {
+            self.ssrc_map.insert(ssrc, user_id);
+            return SpeakerIdentity::Known(user_id);
+        }
+
+        match existing {
+            Some(SpeakerIdentity::Placeholder { label }) => SpeakerIdentity::Placeholder { label },
+            _ => SpeakerIdentity::Placeholder {
+                label: self.placeholder_label(ssrc),
+            },
+        }
+    }
+
+    async fn relabel_placeholder_entries(&self, placeholder: String, user_id: UserId) {
+        let new_name = resolve_user_name(&self.ctx, user_id).await;
+        let sink = Arc::clone(&self.caption_sink);
+        let guild_id = self.guild_id;
+        let channel_id = self.channel_id;
+
+        let placeholder_for_logs = placeholder.clone();
+        match task::spawn_blocking(move || {
+            sink.relabel_placeholder(guild_id, channel_id, &placeholder, user_id, &new_name)
+        })
+        .await
+        {
+            Ok(Ok(true)) => debug!(
+                "[CAPTION] Relabeled placeholder '{}' as user {:?}",
+                placeholder_for_logs, user_id
+            ),
+            Ok(Ok(false)) => debug!(
+                "[CAPTION] No entries needed relabel for placeholder '{}'",
+                placeholder_for_logs
+            ),
+            Ok(Err(err)) => error!(
+                "[CAPTION] Failed relabeling placeholder '{}': {err:?}",
+                placeholder_for_logs
+            ),
+            Err(err) => error!(
+                "[CAPTION] Relabeling task join error for placeholder '{}': {err}",
+                placeholder_for_logs
+            ),
+        }
+    }
 }
 
 impl AudioBuffer {
-    fn new(speaker: UserId) -> Self {
+    fn new(speaker: SpeakerIdentity) -> Self {
         Self {
             samples: Vec::with_capacity(4096),
             speaker,
@@ -377,16 +447,10 @@ impl AudioBuffer {
     }
 }
 
-struct PendingAudio {
-    samples: Vec<i16>,
-}
-
-impl PendingAudio {
-    fn new() -> Self {
-        Self {
-            samples: Vec::with_capacity(4096),
-        }
-    }
+#[derive(Clone, Debug)]
+enum SpeakerIdentity {
+    Known(UserId),
+    Placeholder { label: String },
 }
 
 fn to_serenity_user_id(id: VoiceUserId) -> UserId {

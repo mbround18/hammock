@@ -3,6 +3,7 @@ mod config;
 mod discord_utils;
 mod transcription;
 mod voice;
+mod voice_roster;
 
 use std::{
     env,
@@ -22,7 +23,7 @@ use tokio::{fs, io::AsyncWriteExt, process::Command, sync::oneshot, time::timeou
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    caption_sink_json::CaptionSink,
+    caption_sink_json::{CaptionSink, SessionSummary},
     config::BotConfig,
     discord_utils::resolve_user_name,
     transcription::{TranscriptionHandle, spawn_worker},
@@ -30,6 +31,7 @@ use crate::{
         CaptionPipelineConfig, SpeakerUpdateReceiver, SpeakerUpdateSender, attach_caption_pipeline,
         speaker_update_channel,
     },
+    voice_roster::VoiceRoster,
 };
 use serenity::{
     Client as DiscordClient,
@@ -61,17 +63,20 @@ const ENTRY_SOUND_VOLUME: f32 = 0.5;
 struct BotState {
     chunk_samples: usize,
     sample_rate: u32,
+    chunk_duration: Duration,
     transcriber: TranscriptionHandle,
     speaker_updates: SpeakerUpdateSender,
     caption_sink: Arc<CaptionSink>,
     entry_sound_path: PathBuf,
     active_calls: DashMap<GuildId, ChannelId>,
+    voice_rosters: DashMap<GuildId, Arc<VoiceRoster>>,
 }
 
 impl BotState {
     fn new(
         chunk_samples: usize,
         sample_rate: u32,
+        chunk_duration: Duration,
         transcriber: TranscriptionHandle,
         speaker_updates: SpeakerUpdateSender,
         caption_sink: Arc<CaptionSink>,
@@ -80,16 +85,25 @@ impl BotState {
         Self {
             chunk_samples,
             sample_rate,
+            chunk_duration,
             transcriber,
             speaker_updates,
             caption_sink,
             entry_sound_path,
             active_calls: DashMap::new(),
+            voice_rosters: DashMap::new(),
         }
     }
 
     fn speaker_updates(&self) -> SpeakerUpdateSender {
         self.speaker_updates.clone()
+    }
+
+    fn roster(&self, guild_id: GuildId) -> Arc<VoiceRoster> {
+        self.voice_rosters
+            .entry(guild_id)
+            .or_insert_with(|| Arc::new(VoiceRoster::new(guild_id)))
+            .clone()
     }
 
     fn track_call(&self, guild_id: GuildId, channel_id: ChannelId) {
@@ -100,6 +114,73 @@ impl BotState {
         self.active_calls
             .remove(&guild_id)
             .map(|(_, channel)| channel)
+    }
+
+    async fn prepare_roster(
+        &self,
+        ctx: &serenity::Context,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Arc<VoiceRoster> {
+        let roster = self.roster(guild_id);
+        let bot_id = ctx.cache.current_user().id;
+        let initial_users = ctx
+            .cache
+            .guild(guild_id)
+            .map(|guild| {
+                guild
+                    .voice_states
+                    .iter()
+                    .filter_map(|(user_id, state)| {
+                        if *user_id == bot_id {
+                            return None;
+                        }
+                        (state.channel_id == Some(channel_id)).then_some(*user_id)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        roster.reset(channel_id, initial_users).await;
+        roster
+    }
+
+    async fn clear_roster(&self, guild_id: GuildId) {
+        if let Some(roster) = self.voice_rosters.get(&guild_id) {
+            roster.value().clone().clear().await;
+        }
+    }
+
+    async fn handle_voice_state_update(
+        &self,
+        ctx: &serenity::Context,
+        old: Option<&serenity::model::prelude::VoiceState>,
+        new: &serenity::model::prelude::VoiceState,
+    ) {
+        let Some(guild_id) = new
+            .guild_id
+            .or_else(|| old.and_then(|state| state.guild_id))
+        else {
+            return;
+        };
+        let Some(call_channel) = self.active_calls.get(&guild_id).map(|entry| *entry.value())
+        else {
+            return;
+        };
+
+        let bot_id = ctx.cache.current_user().id;
+        if new.user_id == bot_id {
+            return;
+        }
+
+        let roster = self.roster(guild_id);
+        let old_channel = old.and_then(|state| state.channel_id);
+        let new_channel = new.channel_id;
+
+        if new_channel == Some(call_channel) && old_channel != Some(call_channel) {
+            roster.note_join(call_channel, new.user_id).await;
+        } else if old_channel == Some(call_channel) && new_channel != Some(call_channel) {
+            roster.note_leave(new.user_id).await;
+        }
     }
 }
 
@@ -142,6 +223,7 @@ async fn main() -> anyhow::Result<()> {
     let data = Arc::new(BotState::new(
         config.chunk_samples(),
         config.sample_rate,
+        config.chunk_duration,
         transcriber,
         speaker_updates.clone(),
         caption_sink,
@@ -162,6 +244,14 @@ async fn main() -> anyhow::Result<()> {
     let framework = poise::Framework::builder()
         .options(FrameworkOptions {
             commands: vec![join(), leave(), ping()],
+            event_handler: |ctx, event, _framework, data| {
+                Box::pin(async move {
+                    if let serenity::FullEvent::VoiceStateUpdate { old, new } = event {
+                        data.handle_voice_state_update(ctx, old.as_ref(), new).await;
+                    }
+                    Ok(())
+                })
+            },
             ..Default::default()
         })
         .setup(move |ctx, ready, framework| {
@@ -248,6 +338,10 @@ async fn join(
         tracing::warn!(?err, "Failed to self-mute after joining");
     }
 
+    let roster = state
+        .prepare_roster(ctx.serenity_context(), guild_id, target_channel)
+        .await;
+
     if let Err(err) = attach_caption_pipeline(
         &handler_lock,
         CaptionPipelineConfig {
@@ -258,6 +352,9 @@ async fn join(
             transcriber: state.transcriber.clone(),
             speaker_updates: Some(state.speaker_updates()),
             ctx: ctx.serenity_context().clone(),
+            caption_sink: state.caption_sink.clone(),
+            silence_flush: state.chunk_duration,
+            roster,
         },
     )
     .await
@@ -373,26 +470,35 @@ async fn leave(ctx: BotContext<'_>) -> Result<(), Error> {
         Ok(_) => {
             ctx.say("Left voice channel").await?;
             state.speaker_updates.clear();
-            let transcript_path = state
-                .take_call_channel(guild_id)
-                .and_then(|channel| state.caption_sink.end_session(guild_id, channel));
-            if let Some(file_path) = transcript_path
-                && let Ok(contents) = std::fs::read_to_string(&file_path)
-                && let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents)
-            {
-                let minified = serde_json::to_string(&json).unwrap_or(contents);
-                use poise::{CreateReply, serenity_prelude::CreateAttachment};
-                let file_name = file_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("transcript.json")
-                    .to_string();
-                ctx.send(
-                    CreateReply::default()
-                        .content("Transcript log")
-                        .attachment(CreateAttachment::bytes(minified.into_bytes(), file_name)),
-                )
-                .await?;
+            state.clear_roster(guild_id).await;
+            let transcript_summary = if let Some(channel) = state.take_call_channel(guild_id) {
+                match state.caption_sink.end_session(guild_id, channel) {
+                    Ok(summary) => summary,
+                    Err(err) => {
+                        tracing::error!(?err, "Failed to finalize caption session");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            if let Some(summary) = transcript_summary {
+                if let Ok(contents) = std::fs::read_to_string(&summary.file_path)
+                    && let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents)
+                {
+                    let minified = serde_json::to_string(&json).unwrap_or(contents);
+                    use poise::{CreateReply, serenity_prelude::CreateAttachment};
+                    let label = transcript_label(&summary);
+                    let filename = format!("{}.json", label);
+                    let message = format!("{} ({})", label, summary.duration_hms());
+                    ctx.send(
+                        CreateReply::default()
+                            .content(message)
+                            .attachment(CreateAttachment::bytes(minified.into_bytes(), filename)),
+                    )
+                    .await?;
+                }
             }
         }
         Err(err) => {
@@ -476,6 +582,13 @@ fn invite_permissions() -> Permissions {
         | Permissions::CONNECT
         | Permissions::SPEAK
         | Permissions::USE_VAD
+}
+
+fn transcript_label(summary: &SessionSummary) -> String {
+    match summary.title.as_deref() {
+        Some(title) => format!("{} - {} - Transcription log", summary.date_label(), title),
+        None => format!("{} - Transcription log", summary.date_label()),
+    }
 }
 
 async fn ensure_model_available(config: &BotConfig) -> anyhow::Result<()> {
