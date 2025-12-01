@@ -1,5 +1,5 @@
 [package]
-name = "voice-to-text-bot"
+name = "hammock"
 version = "0.1.0"
 edition = "2024"
 
@@ -45,6 +45,8 @@ which = "8.0.0"
 reqwest = { version = "0.12.24", default-features = false, features = [
     "rustls-tls",
     "stream",
+    "multipart",
+    "json",
 ] }
 futures-util = "0.3.31"
 serde = "1.0.228"

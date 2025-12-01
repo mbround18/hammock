@@ -91,7 +91,7 @@ mod optional_user_id {
     where
         D: Deserializer<'de>,
     {
-        Ok(Option::<UserId>::deserialize(deserializer)?)
+        Option::<UserId>::deserialize(deserializer)
     }
 }
 

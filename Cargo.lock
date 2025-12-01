@@ -910,6 +910,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "hammock"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "dashmap 6.1.0",
+ "dotenvy",
+ "futures-util",
+ "poise",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "serenity",
+ "songbird",
+ "symphonia",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "which",
+ "whisper-rs",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2060,6 +2084,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -3486,30 +3511,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "voice-to-text-bot"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "dashmap 6.1.0",
- "dotenvy",
- "futures-util",
- "poise",
- "reqwest 0.12.24",
- "serde",
- "serde_json",
- "serenity",
- "songbird",
- "symphonia",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "which",
- "whisper-rs",
-]
 
 [[package]]
 name = "walkdir"

@@ -1,9 +1,9 @@
-mod caption_sink_json;
+mod captions;
 mod config;
-mod discord_utils;
+mod summaries;
 mod transcription;
+mod utils;
 mod voice;
-mod voice_roster;
 
 use std::{
     env,
@@ -23,15 +23,15 @@ use tokio::{fs, io::AsyncWriteExt, process::Command, sync::oneshot, time::timeou
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    caption_sink_json::{CaptionSink, SessionSummary},
+    captions::{CaptionSink, SessionSummary},
     config::BotConfig,
-    discord_utils::resolve_user_name,
+    summaries::OpenAiSummarizer,
     transcription::{TranscriptionHandle, spawn_worker},
+    utils::resolve_user_name,
     voice::{
         CaptionPipelineConfig, SpeakerUpdateReceiver, SpeakerUpdateSender, attach_caption_pipeline,
-        speaker_update_channel,
+        roster::VoiceRoster, speaker_update_channel,
     },
-    voice_roster::VoiceRoster,
 };
 use serenity::{
     Client as DiscordClient,
@@ -58,7 +58,6 @@ type CallLock = Arc<tokio::sync::Mutex<Call>>;
 const WHISPER_CPP_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
 const INVITE_SCOPES: &str = "bot%20applications.commands";
 const ENTRY_SOUND_TIMEOUT: Duration = Duration::from_secs(30);
-const ENTRY_SOUND_VOLUME: f32 = 0.5;
 
 struct BotState {
     chunk_samples: usize,
@@ -68,20 +67,37 @@ struct BotState {
     speaker_updates: SpeakerUpdateSender,
     caption_sink: Arc<CaptionSink>,
     entry_sound_path: PathBuf,
+    entry_sound_volume: f32,
+    summarizer: Option<OpenAiSummarizer>,
     active_calls: DashMap<GuildId, ChannelId>,
     voice_rosters: DashMap<GuildId, Arc<VoiceRoster>>,
 }
 
+struct BotStateConfig {
+    chunk_samples: usize,
+    sample_rate: u32,
+    chunk_duration: Duration,
+    transcriber: TranscriptionHandle,
+    speaker_updates: SpeakerUpdateSender,
+    caption_sink: Arc<CaptionSink>,
+    entry_sound_path: PathBuf,
+    entry_sound_volume: f32,
+    summarizer: Option<OpenAiSummarizer>,
+}
+
 impl BotState {
-    fn new(
-        chunk_samples: usize,
-        sample_rate: u32,
-        chunk_duration: Duration,
-        transcriber: TranscriptionHandle,
-        speaker_updates: SpeakerUpdateSender,
-        caption_sink: Arc<CaptionSink>,
-        entry_sound_path: PathBuf,
-    ) -> Self {
+    fn new(config: BotStateConfig) -> Self {
+        let BotStateConfig {
+            chunk_samples,
+            sample_rate,
+            chunk_duration,
+            transcriber,
+            speaker_updates,
+            caption_sink,
+            entry_sound_path,
+            entry_sound_volume,
+            summarizer,
+        } = config;
         Self {
             chunk_samples,
             sample_rate,
@@ -90,6 +106,8 @@ impl BotState {
             speaker_updates,
             caption_sink,
             entry_sound_path,
+            entry_sound_volume,
+            summarizer,
             active_calls: DashMap::new(),
             voice_rosters: DashMap::new(),
         }
@@ -97,6 +115,14 @@ impl BotState {
 
     fn speaker_updates(&self) -> SpeakerUpdateSender {
         self.speaker_updates.clone()
+    }
+
+    fn entry_sound_volume(&self) -> f32 {
+        self.entry_sound_volume
+    }
+
+    fn summarizer(&self) -> Option<OpenAiSummarizer> {
+        self.summarizer.clone()
     }
 
     fn roster(&self, guild_id: GuildId) -> Arc<VoiceRoster> {
@@ -220,15 +246,21 @@ async fn main() -> anyhow::Result<()> {
         config.whisper_use_gpu,
         config.whisper_gpu_device,
     )?;
-    let data = Arc::new(BotState::new(
-        config.chunk_samples(),
-        config.sample_rate,
-        config.chunk_duration,
+    let summarizer = config
+        .openai_api_key
+        .as_ref()
+        .map(|key| OpenAiSummarizer::new(key.clone(), config.openai_model.clone()));
+    let data = Arc::new(BotState::new(BotStateConfig {
+        chunk_samples: config.chunk_samples(),
+        sample_rate: config.sample_rate,
+        chunk_duration: config.chunk_duration,
         transcriber,
-        speaker_updates.clone(),
+        speaker_updates: speaker_updates.clone(),
         caption_sink,
-        config.entry_sound_path.clone(),
-    ));
+        entry_sound_path: config.entry_sound_path.clone(),
+        entry_sound_volume: config.entry_sound_volume,
+        summarizer,
+    }));
 
     let intents = GatewayIntents::GUILDS
         | GatewayIntents::GUILD_MESSAGES
@@ -331,7 +363,8 @@ async fn join(
 
     let state = Arc::clone(ctx.data());
     let entry_sound_path = state.entry_sound_path.clone();
-    if let Err(err) = play_entry_sound(&handler_lock, &entry_sound_path).await {
+    let entry_sound_volume = state.entry_sound_volume();
+    if let Err(err) = play_entry_sound(&handler_lock, &entry_sound_path, entry_sound_volume).await {
         tracing::warn!(?err, "Entry sound playback failed");
     }
     if let Err(err) = self_mute_call(&handler_lock).await {
@@ -383,7 +416,7 @@ async fn join(
     Ok(())
 }
 
-async fn play_entry_sound(call_lock: &CallLock, path: &Path) -> anyhow::Result<()> {
+async fn play_entry_sound(call_lock: &CallLock, path: &Path, volume: f32) -> anyhow::Result<()> {
     if path.as_os_str().is_empty() {
         return Ok(());
     }
@@ -396,7 +429,7 @@ async fn play_entry_sound(call_lock: &CallLock, path: &Path) -> anyhow::Result<(
         let mut call = call_lock.lock().await;
         call.play_only_input(input.into())
     };
-    if let Err(err) = handle.set_volume(ENTRY_SOUND_VOLUME) {
+    if let Err(err) = handle.set_volume(volume) {
         tracing::warn!(?err, "Failed to set entry sound volume");
     }
     handle
@@ -484,20 +517,36 @@ async fn leave(ctx: BotContext<'_>) -> Result<(), Error> {
             };
 
             if let Some(summary) = transcript_summary {
-                if let Ok(contents) = std::fs::read_to_string(&summary.file_path)
-                    && let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents)
-                {
-                    let minified = serde_json::to_string(&json).unwrap_or(contents);
-                    use poise::{CreateReply, serenity_prelude::CreateAttachment};
-                    let label = transcript_label(&summary);
-                    let filename = format!("{}.json", label);
-                    let message = format!("{} ({})", label, summary.duration_hms());
-                    ctx.send(
-                        CreateReply::default()
-                            .content(message)
-                            .attachment(CreateAttachment::bytes(minified.into_bytes(), filename)),
-                    )
-                    .await?;
+                let label = transcript_label(&summary);
+                match std::fs::read_to_string(&summary.file_path) {
+                    Ok(contents) => {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                            let minified = serde_json::to_string(&json).unwrap_or(contents);
+                            use poise::{CreateReply, serenity_prelude::CreateAttachment};
+                            let filename = format!("{}.json", label);
+                            let message = format!("{} ({})", label, summary.duration_hms());
+                            ctx.send(CreateReply::default().content(message).attachment(
+                                CreateAttachment::bytes(minified.into_bytes(), filename),
+                            ))
+                            .await?;
+                        } else {
+                            tracing::warn!("Failed to parse caption JSON before upload");
+                        }
+                    }
+                    Err(err) => tracing::error!(?err, "Failed reading caption file for upload"),
+                }
+
+                if let Some(summarizer) = state.summarizer() {
+                    match summarizer
+                        .summarize_transcript(&summary.file_path, &label)
+                        .await
+                    {
+                        Ok(text) => {
+                            let content = format!("Summary for {}:\n{}", label, text);
+                            ctx.say(content).await?;
+                        }
+                        Err(err) => tracing::error!(?err, "OpenAI transcript summary failed"),
+                    }
                 }
             }
         }

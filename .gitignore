@@ -1,5 +1,5 @@
 /target
 .env
-models/ 
-captions/
+/models
+/captions
 .venv/

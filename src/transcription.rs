@@ -6,7 +6,7 @@ use serenity::model::id::{ChannelId, GuildId, UserId};
 use tokio::sync::mpsc;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext};
 
-use crate::caption_sink_json::CaptionSink;
+use crate::captions::{CaptionEntry, CaptionSink, SpeakerInfo};
 use whisper_rs::WhisperContextParameters;
 
 const PCM_NORMALIZER: f32 = i16::MAX as f32;
@@ -127,8 +127,8 @@ fn transcribe_and_write(
     }
 
     let timestamp = job.started_at.format("%Y-%m-%dT%H:%M:%S").to_string();
-    let entry = crate::caption_sink_json::CaptionEntry {
-        speaker: crate::caption_sink_json::SpeakerInfo {
+    let entry = CaptionEntry {
+        speaker: SpeakerInfo {
             id: job.speaker_id,
             name: job.speaker_name.clone(),
         },

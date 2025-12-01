@@ -5,25 +5,25 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug executable 'voice-to-text-bot'",
+            "name": "Debug executable 'hammock'",
             "type": "lldb",
             "request": "launch",
             "cargo": {
                 "args": [
                     "run",
-                    "--bin=voice-to-text-bot"
+                    "--bin=hammock"
                 ]
             },
             "args": []
         },
         {
-            "name": "Debug unit tests in executable 'voice-to-text-bot'",
+            "name": "Debug unit tests in executable 'hammock'",
             "type": "lldb",
             "request": "launch",
             "cargo": {
                 "args": [
                     "test",
-                    "--bin=voice-to-text-bot"
+                    "--bin=hammock"
                 ]
             }
         }

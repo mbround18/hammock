@@ -3,6 +3,8 @@ use std::{env, path::PathBuf, time::Duration};
 use anyhow::{Context, anyhow};
 use which::which;
 
+const DEFAULT_ENTRY_SOUND_VOLUME: f32 = 0.5;
+
 #[derive(Clone, Debug)]
 pub struct BotConfig {
     pub discord_token: String,
@@ -16,6 +18,9 @@ pub struct BotConfig {
     pub whisper_use_gpu: bool,
     pub whisper_gpu_device: i32,
     pub entry_sound_path: PathBuf,
+    pub entry_sound_volume: f32,
+    pub openai_api_key: Option<String>,
+    pub openai_model: String,
 }
 
 impl BotConfig {
@@ -68,6 +73,13 @@ impl BotConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("resources/announce.mp3"));
         let entry_sound_path = Self::absolute_path(entry_sound_path)?;
+        let entry_sound_volume = env::var("ENTRY_SOUND_VOLUME")
+            .ok()
+            .and_then(|raw| raw.parse::<f32>().ok())
+            .map(|value| value.clamp(0.0, 1.0))
+            .unwrap_or(DEFAULT_ENTRY_SOUND_VOLUME);
+        let openai_api_key = env::var("OPENAPI_KEY").ok();
+        let openai_model = env::var("OPENAPI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
 
         Ok(Self {
             discord_token,
@@ -81,6 +93,9 @@ impl BotConfig {
             whisper_use_gpu,
             whisper_gpu_device,
             entry_sound_path,
+            entry_sound_volume,
+            openai_api_key,
+            openai_model,
         })
     }
 

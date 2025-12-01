@@ -27,11 +27,14 @@ use tokio::{
 use tracing::{debug, error};
 
 use crate::{
-    caption_sink_json::CaptionSink,
-    discord_utils::resolve_user_name,
+    captions::CaptionSink,
     transcription::{TranscriptionHandle, TranscriptionJob},
-    voice_roster::VoiceRoster,
+    utils::resolve_user_name,
 };
+
+pub mod roster;
+
+use self::roster::VoiceRoster;
 
 pub struct CaptionPipelineConfig {
     pub guild_id: GuildId,
@@ -50,31 +53,10 @@ pub async fn attach_caption_pipeline(
     call: &Arc<Mutex<Call>>,
     config: CaptionPipelineConfig,
 ) -> anyhow::Result<()> {
-    let CaptionPipelineConfig {
-        guild_id,
-        channel_id,
-        chunk_samples,
-        sample_rate,
-        transcriber,
-        speaker_updates,
-        ctx,
-        caption_sink,
-        silence_flush,
-        roster,
-    } = config;
+    let guild_id = config.guild_id;
+    let channel_id = config.channel_id;
 
-    let aggregator = Arc::new(AudioAggregator::new(
-        guild_id,
-        channel_id,
-        chunk_samples,
-        sample_rate,
-        transcriber,
-        speaker_updates,
-        ctx,
-        caption_sink,
-        silence_flush,
-        roster,
-    ));
+    let aggregator = Arc::new(AudioAggregator::new(config));
 
     let handler = CaptionReceiver::new(Arc::clone(&aggregator));
 
@@ -145,18 +127,19 @@ struct AudioBuffer {
 }
 
 impl AudioAggregator {
-    fn new(
-        guild_id: GuildId,
-        channel_id: ChannelId,
-        chunk_samples: usize,
-        sample_rate: u32,
-        transcriber: TranscriptionHandle,
-        speaker_updates: Option<SpeakerUpdateSender>,
-        ctx: Context,
-        caption_sink: Arc<CaptionSink>,
-        silence_flush: Duration,
-        roster: Arc<VoiceRoster>,
-    ) -> Self {
+    fn new(config: CaptionPipelineConfig) -> Self {
+        let CaptionPipelineConfig {
+            guild_id,
+            channel_id,
+            chunk_samples,
+            sample_rate,
+            transcriber,
+            speaker_updates,
+            ctx,
+            caption_sink,
+            silence_flush,
+            roster,
+        } = config;
         Self {
             ctx,
             guild_id,
