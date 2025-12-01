@@ -931,6 +931,7 @@ dependencies = [
  "tracing-subscriber",
  "which",
  "whisper-rs",
+ "whisper-rs-sys",
 ]
 
 [[package]]

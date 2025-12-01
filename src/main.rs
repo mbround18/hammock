@@ -69,6 +69,7 @@ struct BotState {
     entry_sound_path: PathBuf,
     entry_sound_volume: f32,
     summarizer: Option<OpenAiSummarizer>,
+    include_transcripts_with_summary: bool,
     active_calls: DashMap<GuildId, ChannelId>,
     voice_rosters: DashMap<GuildId, Arc<VoiceRoster>>,
 }
@@ -83,6 +84,7 @@ struct BotStateConfig {
     entry_sound_path: PathBuf,
     entry_sound_volume: f32,
     summarizer: Option<OpenAiSummarizer>,
+    include_transcripts_with_summary: bool,
 }
 
 impl BotState {
@@ -97,6 +99,7 @@ impl BotState {
             entry_sound_path,
             entry_sound_volume,
             summarizer,
+            include_transcripts_with_summary,
         } = config;
         Self {
             chunk_samples,
@@ -108,6 +111,7 @@ impl BotState {
             entry_sound_path,
             entry_sound_volume,
             summarizer,
+            include_transcripts_with_summary,
             active_calls: DashMap::new(),
             voice_rosters: DashMap::new(),
         }
@@ -123,6 +127,10 @@ impl BotState {
 
     fn summarizer(&self) -> Option<OpenAiSummarizer> {
         self.summarizer.clone()
+    }
+
+    fn include_transcripts_with_summary(&self) -> bool {
+        self.include_transcripts_with_summary
     }
 
     fn roster(&self, guild_id: GuildId) -> Arc<VoiceRoster> {
@@ -250,6 +258,19 @@ async fn main() -> anyhow::Result<()> {
         .openai_api_key
         .as_ref()
         .map(|key| OpenAiSummarizer::new(key.clone(), config.openai_model.clone()));
+    if summarizer.is_some() {
+        let transcript_policy = if config.include_transcripts_with_summary {
+            "will"
+        } else {
+            "will not"
+        };
+        tracing::info!(
+            include_transcripts_with_summary = config.include_transcripts_with_summary,
+            "OpenAI summaries enabled; transcripts {transcript_policy} accompany summaries"
+        );
+    } else {
+        tracing::info!("OpenAI summaries disabled (OPENAPI_KEY not set)");
+    }
     let data = Arc::new(BotState::new(BotStateConfig {
         chunk_samples: config.chunk_samples(),
         sample_rate: config.sample_rate,
@@ -260,6 +281,7 @@ async fn main() -> anyhow::Result<()> {
         entry_sound_path: config.entry_sound_path.clone(),
         entry_sound_volume: config.entry_sound_volume,
         summarizer,
+        include_transcripts_with_summary: config.include_transcripts_with_summary,
     }));
 
     let intents = GatewayIntents::GUILDS
@@ -518,25 +540,38 @@ async fn leave(ctx: BotContext<'_>) -> Result<(), Error> {
 
             if let Some(summary) = transcript_summary {
                 let label = transcript_label(&summary);
-                match std::fs::read_to_string(&summary.file_path) {
-                    Ok(contents) => {
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
-                            let minified = serde_json::to_string(&json).unwrap_or(contents);
-                            use poise::{CreateReply, serenity_prelude::CreateAttachment};
-                            let filename = format!("{}.json", label);
-                            let message = format!("{} ({})", label, summary.duration_hms());
-                            ctx.send(CreateReply::default().content(message).attachment(
-                                CreateAttachment::bytes(minified.into_bytes(), filename),
-                            ))
-                            .await?;
-                        } else {
-                            tracing::warn!("Failed to parse caption JSON before upload");
+                let summarizer = state.summarizer();
+                let should_upload_transcript =
+                    summarizer.is_none() || state.include_transcripts_with_summary();
+
+                if should_upload_transcript {
+                    match std::fs::read_to_string(&summary.file_path) {
+                        Ok(contents) => {
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                                let minified = serde_json::to_string(&json).unwrap_or(contents);
+                                use poise::{CreateReply, serenity_prelude::CreateAttachment};
+                                let filename = format!("{}.json", label);
+                                let message = format!("{} ({})", label, summary.duration_hms());
+                                ctx.send(CreateReply::default().content(message).attachment(
+                                    CreateAttachment::bytes(minified.into_bytes(), filename),
+                                ))
+                                .await?;
+                            } else {
+                                tracing::warn!("Failed to parse caption JSON before upload");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::error!(?err, "Failed reading caption file for upload")
                         }
                     }
-                    Err(err) => tracing::error!(?err, "Failed reading caption file for upload"),
+                } else {
+                    tracing::info!(
+                        %label,
+                        "Skipping transcript upload because INCLUDE_TRANSCRIPTS_WITH_SUMMARY is disabled"
+                    );
                 }
 
-                if let Some(summarizer) = state.summarizer() {
+                if let Some(summarizer) = summarizer {
                     match summarizer
                         .summarize_transcript(&summary.file_path, &label)
                         .await

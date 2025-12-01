@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf, time::Duration};
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use which::which;
 
 const DEFAULT_ENTRY_SOUND_VOLUME: f32 = 0.5;
@@ -21,6 +21,7 @@ pub struct BotConfig {
     pub entry_sound_volume: f32,
     pub openai_api_key: Option<String>,
     pub openai_model: String,
+    pub include_transcripts_with_summary: bool,
 }
 
 impl BotConfig {
@@ -80,6 +81,16 @@ impl BotConfig {
             .unwrap_or(DEFAULT_ENTRY_SOUND_VOLUME);
         let openai_api_key = env::var("OPENAPI_KEY").ok();
         let openai_model = env::var("OPENAPI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+        let include_transcripts_with_summary = env::var("INCLUDE_TRANSCRIPTS_WITH_SUMMARY")
+            .ok()
+            .and_then(|raw| Self::parse_bool(&raw))
+            .unwrap_or(true);
+
+        if openai_api_key.is_none() && !include_transcripts_with_summary {
+            bail!(
+                "INCLUDE_TRANSCRIPTS_WITH_SUMMARY=false requires OPENAPI_KEY; summary-only flow is not possible without an OpenAI key"
+            );
+        }
 
         Ok(Self {
             discord_token,
@@ -96,6 +107,7 @@ impl BotConfig {
             entry_sound_volume,
             openai_api_key,
             openai_model,
+            include_transcripts_with_summary,
         })
     }
 

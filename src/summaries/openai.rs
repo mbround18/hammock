@@ -1,13 +1,10 @@
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow};
-use reqwest::{Client, multipart};
-use serde::Deserialize;
+use anyhow::{Context, Result, anyhow, bail};
+use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::fs;
-use tracing::warn;
 
-const FILES_ENDPOINT: &str = "https://api.openai.com/v1/files";
 const RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 
 #[derive(Clone)]
@@ -31,58 +28,34 @@ impl OpenAiSummarizer {
         file_path: &Path,
         session_label: &str,
     ) -> Result<String> {
-        let file_id = self.upload_transcript(file_path).await?;
-        let summary = self.request_summary(&file_id, session_label).await;
-        self.cleanup_file(&file_id).await;
-        summary
+        let transcript_text = self
+            .load_transcript_text(file_path)
+            .await
+            .context("preparing transcript for summary upload")?;
+        self.request_summary(&transcript_text, session_label).await
     }
 
-    async fn upload_transcript(&self, file_path: &Path) -> Result<String> {
+    async fn load_transcript_text(&self, file_path: &Path) -> Result<String> {
         let bytes = fs::read(file_path)
             .await
             .with_context(|| format!("reading transcript {}", file_path.display()))?;
-        let file_name = file_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("transcript.json");
-        let part = multipart::Part::bytes(bytes)
-            .file_name(file_name.to_string())
-            .mime_str("application/json")
-            .context("encoding transcript upload")?;
-        let form = multipart::Form::new()
-            .text("purpose", "assistants")
-            .part("file", part);
-        let response = self
-            .client
-            .post(FILES_ENDPOINT)
-            .bearer_auth(&self.api_key)
-            .multipart(form)
-            .send()
-            .await
-            .context("uploading transcript to OpenAI")?
-            .error_for_status()
-            .context("OpenAI rejected transcript upload")?;
-
-        let body: FileUploadResponse = response
-            .json()
-            .await
-            .context("parsing transcript upload response")?;
-        Ok(body.id)
+        flatten_transcript(&bytes)
     }
 
-    async fn request_summary(&self, file_id: &str, session_label: &str) -> Result<String> {
+    async fn request_summary(&self, transcript: &str, session_label: &str) -> Result<String> {
         let label = if session_label.trim().is_empty() {
             "Discord session".to_string()
         } else {
             session_label.trim().to_string()
         };
+        let truncated_transcript = truncate_transcript(transcript);
         let payload = json!({
             "model": self.model,
             "input": [
                 {
                     "role": "system",
                     "content": [{
-                        "type": "text",
+                        "type": "input_text",
                         "text": "You summarize Discord call transcripts into concise meeting notes. Respond with markdown bullet lists, call out action items, and keep the answer under 200 words.",
                     }]
                 },
@@ -94,8 +67,8 @@ impl OpenAiSummarizer {
                             "text": format!("Summarize the session titled '{label}'."),
                         },
                         {
-                            "type": "input_file",
-                            "file_id": file_id,
+                            "type": "input_text",
+                            "text": truncated_transcript,
                         }
                     ]
                 }
@@ -109,36 +82,27 @@ impl OpenAiSummarizer {
             .json(&payload)
             .send()
             .await
-            .context("requesting transcript summary from OpenAI")?
-            .error_for_status()
-            .context("OpenAI summary request failed")?;
+            .context("requesting transcript summary from OpenAI")?;
 
-        let body: Value = response
-            .json()
+        let status = response.status();
+        let bytes = response
+            .bytes()
             .await
-            .context("parsing OpenAI summary response")?;
+            .context("reading OpenAI summary response body")?;
+
+        if !status.is_success() {
+            let body = String::from_utf8_lossy(&bytes);
+            return Err(anyhow!(
+                "OpenAI summary request failed: status {status}, body: {body}"
+            ));
+        }
+
+        let body: Value =
+            serde_json::from_slice(&bytes).context("parsing OpenAI summary response")?;
 
         extract_summary_text(&body)
             .ok_or_else(|| anyhow!("OpenAI summary response did not include text: {}", body))
     }
-
-    async fn cleanup_file(&self, file_id: &str) {
-        let delete_url = format!("{FILES_ENDPOINT}/{}", file_id);
-        let result = self
-            .client
-            .delete(delete_url)
-            .bearer_auth(&self.api_key)
-            .send()
-            .await;
-        if let Err(err) = result {
-            warn!(?err, "Failed cleaning up uploaded transcript on OpenAI");
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct FileUploadResponse {
-    id: String,
 }
 
 fn extract_summary_text(value: &Value) -> Option<String> {
@@ -167,4 +131,89 @@ fn first_text(value: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn flatten_transcript(bytes: &[u8]) -> Result<String> {
+    let value: Value = serde_json::from_slice(bytes).context("parsing caption JSON")?;
+
+    let mut buffer = String::with_capacity(bytes.len());
+
+    if let Some(metadata) = value.get("metadata").and_then(Value::as_object) {
+        if let Some(title) = metadata.get("title").and_then(Value::as_str) {
+            let trimmed = title.trim();
+            if !trimmed.is_empty() {
+                buffer.push_str("Session Title: ");
+                buffer.push_str(trimmed);
+                buffer.push('\n');
+            }
+        }
+        if let Some(started) = metadata.get("started_at").and_then(Value::as_str) {
+            buffer.push_str("Started At: ");
+            buffer.push_str(started);
+            buffer.push('\n');
+        }
+        if let Some(ended) = metadata.get("ended_at").and_then(Value::as_str) {
+            buffer.push_str("Ended At: ");
+            buffer.push_str(ended);
+            buffer.push('\n');
+        }
+        if let Some(duration) = metadata.get("duration_formatted").and_then(Value::as_str) {
+            buffer.push_str("Duration: ");
+            buffer.push_str(duration);
+            buffer.push('\n');
+        }
+        buffer.push('\n');
+    }
+
+    buffer.push_str("Transcript:\n");
+
+    let mut wrote_any = false;
+    if let Some(entries) = value.get("transcriptions").and_then(Value::as_array) {
+        for entry in entries {
+            let timestamp = entry
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown time");
+            let speaker = entry
+                .get("speaker")
+                .and_then(|speaker| speaker.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown Speaker");
+            let comment = entry
+                .get("comment")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+
+            if comment.is_empty() {
+                continue;
+            }
+
+            buffer.push('[');
+            buffer.push_str(timestamp);
+            buffer.push_str("] ");
+            buffer.push_str(speaker);
+            buffer.push_str(": ");
+            buffer.push_str(comment);
+            buffer.push('\n');
+            wrote_any = true;
+        }
+    }
+
+    if !wrote_any {
+        bail!("transcript JSON did not contain any caption entries");
+    }
+
+    Ok(buffer)
+}
+
+fn truncate_transcript(transcript: &str) -> String {
+    const MAX_CHARS: usize = 60_000;
+    if transcript.len() <= MAX_CHARS {
+        return transcript.to_string();
+    }
+
+    let mut truncated = transcript[..MAX_CHARS].to_string();
+    truncated.push_str("\n\n[Transcript truncated]");
+    truncated
 }

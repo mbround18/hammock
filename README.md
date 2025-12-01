@@ -30,6 +30,7 @@ Copy `.env.sample` to `.env` (or export the variables directly) and fill in the 
 | `ALLOW_SONGBIRD_UDP_ERRORS` | ❌ | `0` | Flip to `1` to re-enable Songbird "Illegal RTP message" logs for low-level debugging. |
 | `OPENAPI_KEY` | ❌ | – | Provide an OpenAI API key to enable automatic transcript summaries via the Responses API. Captions are uploaded temporarily and deleted once the response arrives. |
 | `OPENAPI_MODEL` | ❌ | `gpt-4o-mini` | Model sent to the OpenAI responses endpoint when producing summaries. |
+| `INCLUDE_TRANSCRIPTS_WITH_SUMMARY` | ❌ | `true` | When summaries are enabled, control whether the raw JSON transcript is also uploaded to Discord alongside the summary message. Setting this to `false` requires `OPENAPI_KEY`. |
 
 \* If `WHISPER_MODEL_PATH` is omitted but the `whisper` CLI is available, the bot assumes the model should live in `WHISPER_MODEL_DIR/ggml-<WHISPER_MODEL_NAME>.bin` and invokes the CLI with `--download-only` to fetch it. When an explicit `WHISPER_MODEL_PATH` is provided, the parent directory of that path is reused for future downloads.
 
@@ -58,3 +59,5 @@ Caption sessions are rewritten into JSON under `CAPTION_OUTPUT_DIR` using the sc
 ### Transcript summaries
 
 With `OPENAPI_KEY` set the `/leave` command also uploads the finished JSON transcript to OpenAI's Responses API, asks the configured `OPENAPI_MODEL` for concise Markdown notes, and posts the result underneath the transcription attachment before deleting the temporary upload.
+
+If you prefer to share only the AI summary (and keep the JSON transcript private) set `INCLUDE_TRANSCRIPTS_WITH_SUMMARY=false`. This mode requires `OPENAPI_KEY`; the bot will fail fast if a summary is requested but no key is configured. The transcript is always uploaded when summarization is disabled.

@@ -1,16 +1,23 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    ffi::CStr,
+    os::raw::{c_char, c_void},
+    path::PathBuf,
+    sync::{Arc, Once},
+};
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use serenity::model::id::{ChannelId, GuildId, UserId};
 use tokio::sync::mpsc;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext};
+use whisper_rs_sys::{ggml_log_level, whisper_log_set};
 
 use crate::captions::{CaptionEntry, CaptionSink, SpeakerInfo};
 use whisper_rs::WhisperContextParameters;
 
 const PCM_NORMALIZER: f32 = i16::MAX as f32;
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
+static WHISPER_LOGGER: Once = Once::new();
 
 pub struct TranscriptionJob {
     pub channel_id: ChannelId,
@@ -61,6 +68,7 @@ pub fn spawn_worker(
     if effective_use_gpu {
         ctx_params.gpu_device(gpu_device);
     }
+    install_whisper_logger();
     let ctx = Arc::new(
         WhisperContext::new_with_params(&model_path_str, ctx_params)
             .context("loading Whisper model")?,
@@ -126,17 +134,56 @@ fn transcribe_and_write(
         return Ok(());
     }
 
+    let normalized = normalized.to_string();
+    let user_id = job.speaker_id.map(|id| id.get());
+    tracing::info!(
+        target = "transcription",
+        guild = %job.guild_id,
+        channel = %job.channel_id,
+        speaker = %job.speaker_name,
+        speaker_id = ?user_id,
+        text = %normalized,
+        "captured transcript line"
+    );
+
     let timestamp = job.started_at.format("%Y-%m-%dT%H:%M:%S").to_string();
     let entry = CaptionEntry {
         speaker: SpeakerInfo {
             id: job.speaker_id,
             name: job.speaker_name.clone(),
         },
-        comment: normalized.to_string(),
+        comment: normalized,
         timestamp,
     };
     sink.append_json(job.guild_id, job.channel_id, entry)?;
     Ok(())
+}
+
+fn install_whisper_logger() {
+    WHISPER_LOGGER.call_once(|| unsafe {
+        whisper_log_set(Some(whisper_log_forwarder), std::ptr::null_mut());
+    });
+}
+
+unsafe extern "C" fn whisper_log_forwarder(
+    level: ggml_log_level,
+    text: *const c_char,
+    _user: *mut c_void,
+) {
+    if text.is_null() {
+        return;
+    }
+
+    let message = match unsafe { CStr::from_ptr(text) }.to_str() {
+        Ok(value) => value.trim(),
+        Err(_) => return,
+    };
+
+    if message.is_empty() {
+        return;
+    }
+
+    tracing::debug!(target = "whisper", ?level, "{message}");
 }
 
 fn prepare_audio(samples: &[i16], sample_rate: u32) -> Vec<f32> {
