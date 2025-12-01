@@ -1,0 +1,7 @@
+[project]
+name = "voice-to-text-bot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = ["openai-whisper>=20250625", "setuptools-rust>=1.12.0"]
