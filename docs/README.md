@@ -26,7 +26,7 @@ Hammock captures Discord voice chat audio, transcribes it with Whisper, and writ
 
 ## Quick Links
 
-- [License](./LICENSE.md)
+- [License](../LICENSE.md)
 - [Privacy Notice](./PRIVACY.md)
 - [Disclaimer](./DISCLAIMER.md)
 - [Contributing](./CONTRIBUTING.md)
@@ -128,7 +128,7 @@ Discord occasionally delivers malformed UDP packets that Songbird flags as “Il
 
 ## License
 
-Hammock is distributed under the [GNU Affero General Public License v3.0](./LICENSE.md).
+Hammock is distributed under the [GNU Affero General Public License v3.0](../LICENSE.md).
 
 ### Why AGPL 3.0?
 
