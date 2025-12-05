@@ -1,14 +1,43 @@
 # Hammock
 
-Hammock captures Discord voice chat audio, transcribes it with Whisper, and writes timestamped caption lines per channel. It is built for self-hosting: you run it, you retain the data, and you decide where the JSON transcripts live.
+Hammock captures Discord voice chat audio, transcribes it with Whisper, and writes timestamped captions per channel. It is purpose-built for self-hosting: you run it, you keep the data, and you decide where the JSON transcripts live.
+
+## Highlights
+
+- Self-hosted, privacy-first captioning for Discord voice channels
+- Real-time transcription backed by Whisper (GGML/GGUF) with GPU acceleration support
+- Built-in Actix control plane exposing health probes, metrics, invite links, and OpenAPI docs
+- Production-ready Docker + Compose workflow with persistent volumes for models and transcripts
+- Optional OpenAI-powered summaries that can be shared alongside or instead of transcripts
+
+## Table of Contents
+
+1. [Quick Links](#quick-links)
+2. [Prerequisites](#prerequisites)
+3. [Configuration & Environment](#configuration--environment)
+4. [Running Locally](#running-locally)
+5. [Docker & Compose](#docker--compose)
+6. [Health & Telemetry](#health--telemetry)
+7. [Privacy & Data Handling](#privacy--data-handling)
+8. [Slash Commands](#slash-commands)
+9. [Transcript Summaries](#transcript-summaries)
+10. [Performance Notes](#performance-notes)
+11. [License](#license)
+
+## Quick Links
+
+- [License](./LICENSE.md)
+- [Privacy Notice](./PRIVACY.md)
+- [Disclaimer](./DISCLAIMER.md)
+- [Contributing](./CONTRIBUTING.md)
 
 ## Prerequisites
 
 - Rust toolchain (edition 2024)
 - Discord bot token with the `MESSAGE_CONTENT` and `GUILD_VOICE_STATES` intents enabled
-- A Whisper GGML/GGUF model file on disk
+- Whisper GGML/GGUF model file available on disk (or the `whisper` CLI to download one)
 
-## Configuration & environment
+## Configuration & Environment
 
 Copy `.env.sample` to `.env` (or export the variables directly) and fill in the values that match your deployment. The bot loads `.env` automatically via `dotenvy` when `cargo run` starts.
 
@@ -34,33 +63,27 @@ Copy `.env.sample` to `.env` (or export the variables directly) and fill in the 
 
 \* If `WHISPER_MODEL_PATH` is omitted but the `whisper` CLI is available, the bot assumes the model should live in `WHISPER_MODEL_DIR/ggml-<WHISPER_MODEL_NAME>.bin` and invokes the CLI with `--download-only` to fetch it. When an explicit `WHISPER_MODEL_PATH` is provided, the parent directory of that path is reused for future downloads.
 
-### GPU acceleration
-
-Build with `cargo run --release --features cuda` to compile Whisper with cuBLAS support. With the CUDA toolkit (including `nvcc`) and NVIDIA drivers installed inside WSL, inference will automatically use the GPU. Use `WHISPER_USE_GPU=false` to temporarily fall back to CPU if the GPU stack is unavailable.
-
-### Logging noise
-
-Discord occasionally delivers malformed UDP packets that Songbird flags as “Illegal RTP message received.” The bot now suppresses those error-level logs by default to avoid flooding the console. Set `ALLOW_SONGBIRD_UDP_ERRORS=1` if you need the raw Songbird UDP logs for troubleshooting.
-
-## Running the bot
+## Running Locally
 
 ```bash
 cargo run --release
 ```
 
-### Quick start with Docker Compose
+Provide the `.env` file and ensure `models/` and `captions/` exist if you plan to persist data locally.
 
-The repository includes a multi-stage `Dockerfile` and a `compose.yml` for local or cluster deployments:
+## Docker & Compose
+
+The repository includes a multi-stage `Dockerfile` and a production-friendly `compose.yml`. Build and launch with:
 
 ```bash
 docker compose up --build -d
 ```
 
-Compose builds the optimized binary, installs the Python dependencies with `uv`, mounts `./captions` and `./models` into the container, and exposes the internal web server on `8080`. Provide your `.env` file to the service (Compose already loads it) and mount a persistent volume if you want transcripts to survive container recreation.
+Compose builds the optimized binary, installs Python dependencies with `uv`, mounts `./captions` and `./models` into the container, and exposes the internal web server on `8080`. Provide your `.env` file to the service (Compose already loads it) and mount persistent volumes if you want transcripts to survive container recreation.
 
-### Kubernetes-friendly control plane
+## Health & Telemetry
 
-Hammock also starts a lightweight Actix web server (default bind `0.0.0.0:8080`, configurable via `HTTP_BIND_ADDR`). The endpoints are designed for Kubernetes or any other health/metrics consumer:
+Hammock exposes a lightweight Actix web server (default bind `0.0.0.0:8080`, configurable via `HTTP_BIND_ADDR`). Endpoints are designed for Kubernetes or any other health/metrics consumer:
 
 - `GET /k8s/readyz` – readiness probe (includes uptime)
 - `GET /k8s/livez` – liveness probe driven by the active guild/channel state
@@ -68,27 +91,45 @@ Hammock also starts a lightweight Actix web server (default bind `0.0.0.0:8080`,
 - `GET /invite` – HTTP redirect to the discovered Discord invite link
 - `GET /docs` – OpenAPI document describing every endpoint
 
-Expose port `8080` (the `Dockerfile` does so via `EXPOSE 8080`) and wire the probes directly into your orchestration platform. The built-in Docker health check already monitors `/k8s/readyz` when you run the official image.
+Expose port `8080` (the `Dockerfile` already uses `EXPOSE 8080`) and wire the probes directly into your orchestration platform. The built-in Docker health check monitors `/k8s/readyz` automatically.
 
-### Self-hosted privacy contract
+## Privacy & Data Handling
 
-By design this project never uploads audio or text to third parties unless you supply an `OPENAPI_KEY` for optional summaries. JSON transcript files stay under `CAPTION_OUTPUT_DIR`. You, as the operator, are responsible for disclosure, consent, retention, and compliance. Two participant-labeling modes exist because of Discord's encryption model:
+Hammock never uploads audio or text to third parties unless you supply an `OPENAPI_KEY` for optional summaries. JSON transcript files stay under `CAPTION_OUTPUT_DIR`. You, as the operator, are responsible for disclosure, consent, retention, and compliance. Two participant-labeling modes exist because of Discord's encryption model:
 
 1. **Transparent mode** – the bot joins first, so Discord exposes usernames and Hammock uses them verbatim.
 2. **Randomized mode** – the bot joins mid-call, so each speaker receives a stable numeric placeholder for that session.
 
 See [`docs/PRIVACY.md`](./PRIVACY.md) for the full policy and operator obligations. Do not deploy Hammock unless you are comfortable owning the data it produces.
 
-In Discord, use the registered slash commands:
+## Slash Commands
 
 - `/join [voice_channel]` – start listening in a channel or omit the option to join your current voice channel
 - `/leave` – disconnect and stop captioning
-- `/ping` – health check
+- `/ping` – lightweight health check
 
 Caption sessions are rewritten into JSON under `CAPTION_OUTPUT_DIR` using the schema emitted by `src/captions/json.rs` (files look like `<guild>_<channel>_<timestamp>[_slug].json`). Each entry includes timestamps, speaker metadata (real names or numeric placeholders), and the transcribed comment. `/leave` uploads the finished file back to the invoking channel when possible.
 
-### Transcript summaries
+## Transcript Summaries
 
-With `OPENAPI_KEY` set the `/leave` command also uploads the finished JSON transcript to OpenAI's Responses API, asks the configured `OPENAPI_MODEL` for concise Markdown notes, and posts the result underneath the transcription attachment before deleting the temporary upload.
+With `OPENAPI_KEY` set, the `/leave` command uploads the finished JSON transcript to OpenAI's Responses API, asks the configured `OPENAPI_MODEL` for concise Markdown notes, and posts the result underneath the transcription attachment before deleting the temporary upload.
 
-If you prefer to share only the AI summary (and keep the JSON transcript private) set `INCLUDE_TRANSCRIPTS_WITH_SUMMARY=false`. This mode requires `OPENAPI_KEY`; the bot will fail fast if a summary is requested but no key is configured. The transcript is always uploaded when summarization is disabled.
+Set `INCLUDE_TRANSCRIPTS_WITH_SUMMARY=false` if you want to share only the AI summary (and keep the JSON transcript private). This mode requires `OPENAPI_KEY`; the bot fails fast if a summary is requested but no key is configured. The transcript is always uploaded when summarization is disabled.
+
+## Performance Notes
+
+### GPU acceleration
+
+Build with `cargo run --release --features cuda` to compile Whisper with cuBLAS support. With the CUDA toolkit (including `nvcc`) and NVIDIA drivers installed inside WSL or Linux, inference will automatically use the GPU. Use `WHISPER_USE_GPU=false` to fall back to CPU if the GPU stack is unavailable.
+
+### Logging noise
+
+Discord occasionally delivers malformed UDP packets that Songbird flags as “Illegal RTP message received.” Hammock suppresses those error-level logs by default to avoid flooding the console. Set `ALLOW_SONGBIRD_UDP_ERRORS=1` if you need the raw Songbird UDP logs for troubleshooting.
+
+## License
+
+Hammock is distributed under the [GNU Affero General Public License v3.0](./LICENSE.md).
+
+### Why AGPL 3.0?
+
+AGPL 3.0 encourages transparency and protects users. This project handles live audio capture and AI-generated transcripts, so the license ensures that anyone who hosts or modifies the software must keep their changes open and disclose how data is handled. It also provides strong liability protection and prevents private, closed-source services from taking the code without sharing improvements. We are open to future license changes if a compelling need arises.

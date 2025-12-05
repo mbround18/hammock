@@ -40,7 +40,7 @@ center. The guidelines below describe the preferred workflow.
    visibility.
 6. **Documentation** – Update `docs/README.md`, `docs/PRIVACY.md`, and `docs/CONTRIBUTING.md`
    when you add commands, env vars, or other operator-facing behavior.
-7. **Pull request** – Describe *why* the change is needed, include manual/automated test
+7. **Pull request** – Describe _why_ the change is needed, include manual/automated test
    evidence, and link to any relevant issues. If the change alters behavior, mention how to
    roll it out safely (config flags, migrations, etc.).
 
