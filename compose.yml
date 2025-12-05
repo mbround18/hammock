@@ -11,7 +11,7 @@ services:
         APP_HOME: ${APP_HOME:-/app}
         BIN_NAME: ${BIN_NAME:-hammock}
         VENV_PATH: ${VENV_PATH:-/app/venv}
-    image: hammock:${VERSION:-development}
+    image: mbround18/hammock:${VERSION:-development}
     restart: unless-stopped
     ports:
       - "8080:8080"

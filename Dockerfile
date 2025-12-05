@@ -4,6 +4,8 @@ ARG RUNTIME_VARIANT=bookworm-slim
 ARG APP_HOME=/app
 ARG BIN_NAME=hammock
 ARG VENV_PATH=/app/venv
+ARG BOT_UID=1000
+ARG BOT_GID=1000
 
 FROM rust:${RUST_VERSION}-${DEBIAN_SUITE} AS chef
 ARG APP_HOME
@@ -36,12 +38,17 @@ FROM debian:${RUNTIME_VARIANT} AS runtime
 ARG APP_HOME
 ARG BIN_NAME
 ARG VENV_PATH
+ARG BOT_UID
+ARG BOT_GID
 WORKDIR ${APP_HOME}
 
-RUN apt-get update \
+RUN --mount=type=cache,target=/var/lib/apt/lists \
+    --mount=type=cache,target=/var/cache/apt \
+    apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl libopus0 libgomp1 cmake build-essential pkg-config \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --home ${APP_HOME} bot
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
+    && groupadd --gid ${BOT_GID} bot \
+    && useradd --uid ${BOT_UID} --gid ${BOT_GID} --create-home --home ${APP_HOME} bot
 
 COPY --from=uv /uv /uvx /bin/
 
@@ -49,18 +56,32 @@ ENV UV_PROJECT_ENVIRONMENT=${VENV_PATH} \
     VIRTUAL_ENV=${VENV_PATH} \
     PATH=${VENV_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     WHISPER_CLI_PATH=${VENV_PATH}/bin/whisper \
-    CAPTION_OUTPUT_DIR=${APP_HOME}/captions
+    CAPTION_OUTPUT_DIR=${APP_HOME}/captions \
+    UV_CACHE_DIR=${APP_HOME}/.cache/uv \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1
 
-COPY pyproject.toml uv.lock ./
+RUN mkdir -p ${CAPTION_OUTPUT_DIR} ${APP_HOME}/models ${VENV_PATH} ${UV_CACHE_DIR} \
+    && chown -R bot:bot ${APP_HOME}
 
-RUN uv python install 3.13 \
+USER bot
+
+COPY --chown=bot:bot pyproject.toml uv.lock ./
+
+RUN --mount=type=cache,target=${APP_HOME}/.cache/uv,uid=${BOT_UID},gid=${BOT_GID} \
+    uv python install 3.13 \
     && uv python pin 3.13 \
     && uv sync --locked
 
-COPY --from=builder ${APP_HOME}/target/release/${BIN_NAME} /usr/local/bin/${BIN_NAME}
-COPY resources ./resources
+USER root
 
-RUN mkdir -p ${CAPTION_OUTPUT_DIR} && chown -R bot:bot ${APP_HOME}
+COPY --from=builder ${APP_HOME}/target/release/${BIN_NAME} /usr/local/bin/${BIN_NAME}
+COPY --chown=bot:bot resources ./resources
+
+RUN --mount=type=cache,target=/var/lib/apt/lists \
+    --mount=type=cache,target=/var/cache/apt \
+    apt-get purge -y --auto-remove build-essential pkg-config cmake \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 VOLUME ["/app/captions", "/app/models"]
 USER bot
