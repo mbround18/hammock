@@ -1,6 +1,7 @@
 mod captions;
 mod config;
 mod summaries;
+mod telemetry;
 mod transcription;
 mod utils;
 mod voice;
@@ -26,6 +27,7 @@ use crate::{
     captions::{CaptionSink, SessionSummary},
     config::BotConfig,
     summaries::OpenAiSummarizer,
+    telemetry::{AppMetrics, InviteTracker, spawn_http_server},
     transcription::{TranscriptionHandle, spawn_worker},
     utils::resolve_user_name,
     voice::{
@@ -59,7 +61,7 @@ const WHISPER_CPP_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp
 const INVITE_SCOPES: &str = "bot%20applications.commands";
 const ENTRY_SOUND_TIMEOUT: Duration = Duration::from_secs(30);
 
-struct BotState {
+pub struct BotState {
     chunk_samples: usize,
     sample_rate: u32,
     chunk_duration: Duration,
@@ -72,6 +74,7 @@ struct BotState {
     include_transcripts_with_summary: bool,
     active_calls: DashMap<GuildId, ChannelId>,
     voice_rosters: DashMap<GuildId, Arc<VoiceRoster>>,
+    metrics: Arc<AppMetrics>,
 }
 
 struct BotStateConfig {
@@ -85,6 +88,7 @@ struct BotStateConfig {
     entry_sound_volume: f32,
     summarizer: Option<OpenAiSummarizer>,
     include_transcripts_with_summary: bool,
+    metrics: Arc<AppMetrics>,
 }
 
 impl BotState {
@@ -100,6 +104,7 @@ impl BotState {
             entry_sound_volume,
             summarizer,
             include_transcripts_with_summary,
+            metrics,
         } = config;
         Self {
             chunk_samples,
@@ -114,6 +119,7 @@ impl BotState {
             include_transcripts_with_summary,
             active_calls: DashMap::new(),
             voice_rosters: DashMap::new(),
+            metrics,
         }
     }
 
@@ -148,6 +154,25 @@ impl BotState {
         self.active_calls
             .remove(&guild_id)
             .map(|(_, channel)| channel)
+    }
+
+    pub fn connected_guilds(&self) -> usize {
+        self.active_calls.len()
+    }
+
+    pub fn connected_channels(&self) -> usize {
+        self.active_calls.len()
+    }
+
+    pub fn active_participants(&self) -> usize {
+        self.active_calls
+            .iter()
+            .filter_map(|entry| {
+                self.voice_rosters
+                    .get(entry.key())
+                    .map(|roster| roster.value().participant_count())
+            })
+            .sum()
     }
 
     async fn prepare_roster(
@@ -243,6 +268,8 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) = std::fs::create_dir_all(&config.caption_dir) {
         tracing::error!(?e, "Failed to create caption output directory");
     }
+    let metrics = Arc::new(AppMetrics::new());
+    let invite_tracker = InviteTracker::default();
     let (speaker_updates, speaker_rx) = speaker_update_channel();
     let speaker_rx = Arc::new(StdMutex::new(Some(speaker_rx)));
     ensure_model_available(&config).await?;
@@ -253,6 +280,7 @@ async fn main() -> anyhow::Result<()> {
         config.whisper_language.clone(),
         config.whisper_use_gpu,
         config.whisper_gpu_device,
+        Arc::clone(&metrics),
     )?;
     let summarizer = config
         .openai_api_key
@@ -282,7 +310,15 @@ async fn main() -> anyhow::Result<()> {
         entry_sound_volume: config.entry_sound_volume,
         summarizer,
         include_transcripts_with_summary: config.include_transcripts_with_summary,
+        metrics: Arc::clone(&metrics),
     }));
+
+    let _http_server = spawn_http_server(
+        config.http_bind_addr,
+        Arc::clone(&data),
+        metrics,
+        invite_tracker.clone(),
+    )?;
 
     let intents = GatewayIntents::GUILDS
         | GatewayIntents::GUILD_MESSAGES
@@ -311,13 +347,16 @@ async fn main() -> anyhow::Result<()> {
         .setup(move |ctx, ready, framework| {
             let data = Arc::clone(&data);
             let speaker_rx = Arc::clone(&speaker_rx);
+            let invite_tracker = invite_tracker.clone();
             Box::pin(async move {
                 tracing::info!("{} is connected", ready.user.name);
                 if let Some(rx) = speaker_rx.lock().unwrap().take() {
                     tokio::spawn(run_presence_task(ctx.clone(), rx));
                 }
                 builtins::register_globally(ctx, &framework.options().commands).await?;
-                tracing::info!("Invite URL: {}", build_invite_url(ready.user.id));
+                let invite = build_invite_url(ready.user.id);
+                invite_tracker.set(invite.clone());
+                tracing::info!("Invite URL: {invite}");
                 Ok(data)
             })
         })
@@ -428,6 +467,7 @@ async fn join(
                 .await?;
         } else {
             let mut response = format!("Listening in {}", target_channel.mention());
+            state.metrics.record_session_started();
             if let Some(title) = session_title.as_ref() {
                 response.push_str(&format!(" — notes titled \"{}\"", title));
             }
@@ -526,17 +566,23 @@ async fn leave(ctx: BotContext<'_>) -> Result<(), Error> {
             ctx.say("Left voice channel").await?;
             state.speaker_updates.clear();
             state.clear_roster(guild_id).await;
-            let transcript_summary = if let Some(channel) = state.take_call_channel(guild_id) {
-                match state.caption_sink.end_session(guild_id, channel) {
-                    Ok(summary) => summary,
-                    Err(err) => {
-                        tracing::error!(?err, "Failed to finalize caption session");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
+            let (transcript_summary, had_session) =
+                if let Some(channel) = state.take_call_channel(guild_id) {
+                    let summary = match state.caption_sink.end_session(guild_id, channel) {
+                        Ok(summary) => summary,
+                        Err(err) => {
+                            tracing::error!(?err, "Failed to finalize caption session");
+                            None
+                        }
+                    };
+                    (summary, true)
+                } else {
+                    (None, false)
+                };
+
+            if had_session {
+                state.metrics.record_session_completed();
+            }
 
             if let Some(summary) = transcript_summary {
                 let label = transcript_label(&summary);

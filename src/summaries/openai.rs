@@ -122,10 +122,10 @@ fn first_text(value: &Value) -> Option<String> {
                     return Some(trimmed.to_string());
                 }
             }
-            if let Some(content) = map.get("content") {
-                if let Some(text) = first_text(content) {
-                    return Some(text);
-                }
+            if let Some(content) = map.get("content")
+                && let Some(text) = first_text(content)
+            {
+                return Some(text);
             }
             map.values().find_map(first_text)
         }

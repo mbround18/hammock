@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf, time::Duration};
+use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, anyhow, bail};
 use which::which;
@@ -22,6 +22,7 @@ pub struct BotConfig {
     pub openai_api_key: Option<String>,
     pub openai_model: String,
     pub include_transcripts_with_summary: bool,
+    pub http_bind_addr: SocketAddr,
 }
 
 impl BotConfig {
@@ -85,6 +86,10 @@ impl BotConfig {
             .ok()
             .and_then(|raw| Self::parse_bool(&raw))
             .unwrap_or(true);
+        let http_bind_addr = env::var("HTTP_BIND_ADDR")
+            .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
+            .parse()
+            .context("Invalid HTTP_BIND_ADDR value")?;
 
         if openai_api_key.is_none() && !include_transcripts_with_summary {
             bail!(
@@ -108,6 +113,7 @@ impl BotConfig {
             openai_api_key,
             openai_model,
             include_transcripts_with_summary,
+            http_bind_addr,
         })
     }
 

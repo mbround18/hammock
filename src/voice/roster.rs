@@ -119,6 +119,10 @@ impl VoiceRoster {
         let mut pending = self.pending.lock().await;
         pending.clear();
     }
+
+    pub fn participant_count(&self) -> usize {
+        self.participants.len()
+    }
 }
 
 struct ParticipantRecord {

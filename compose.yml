@@ -1,0 +1,22 @@
+services:
+  hammock:
+    stop_grace_period: 30s
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        RUST_VERSION: ${RUST_VERSION:-1.91}
+        DEBIAN_SUITE: ${DEBIAN_SUITE:-bookworm}
+        RUNTIME_VARIANT: ${RUNTIME_VARIANT:-bookworm-slim}
+        APP_HOME: ${APP_HOME:-/app}
+        BIN_NAME: ${BIN_NAME:-hammock}
+        VENV_PATH: ${VENV_PATH:-/app/venv}
+    image: hammock:${VERSION:-development}
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - ./captions:/app/captions
+      - ./models:/app/models

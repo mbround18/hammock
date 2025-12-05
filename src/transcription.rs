@@ -12,7 +12,10 @@ use tokio::sync::mpsc;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext};
 use whisper_rs_sys::{ggml_log_level, whisper_log_set};
 
-use crate::captions::{CaptionEntry, CaptionSink, SpeakerInfo};
+use crate::{
+    captions::{CaptionEntry, CaptionSink, SpeakerInfo},
+    telemetry::AppMetrics,
+};
 use whisper_rs::WhisperContextParameters;
 
 const PCM_NORMALIZER: f32 = i16::MAX as f32;
@@ -49,6 +52,7 @@ pub fn spawn_worker(
     language: Option<String>,
     use_gpu: bool,
     gpu_device: i32,
+    metrics: Arc<AppMetrics>,
 ) -> anyhow::Result<TranscriptionHandle> {
     let (tx, mut rx) = mpsc::channel::<TranscriptionJob>(32);
     let model_path_str = model_path
@@ -75,12 +79,16 @@ pub fn spawn_worker(
     );
 
     tokio::spawn(async move {
+        let metrics = Arc::clone(&metrics);
         while let Some(job) = rx.recv().await {
             let ctx = Arc::clone(&ctx);
             let sink = Arc::clone(&sink);
             let language = language.clone();
+            let metrics = Arc::clone(&metrics);
             if let Err(err) = tokio::task::spawn_blocking(move || {
-                if let Err(inner) = transcribe_and_write(ctx, sink, job, language.as_deref()) {
+                if let Err(inner) =
+                    transcribe_and_write(ctx, sink, job, language.as_deref(), metrics)
+                {
                     tracing::error!("transcription failed: {inner:?}");
                 }
             })
@@ -99,6 +107,7 @@ fn transcribe_and_write(
     sink: Arc<CaptionSink>,
     job: TranscriptionJob,
     language: Option<&str>,
+    metrics: Arc<AppMetrics>,
 ) -> anyhow::Result<()> {
     if job.pcm.is_empty() {
         return Ok(());
@@ -136,7 +145,7 @@ fn transcribe_and_write(
 
     let normalized = normalized.to_string();
     let user_id = job.speaker_id.map(|id| id.get());
-    tracing::info!(
+    tracing::debug!(
         target = "transcription",
         guild = %job.guild_id,
         channel = %job.channel_id,
@@ -156,6 +165,7 @@ fn transcribe_and_write(
         timestamp,
     };
     sink.append_json(job.guild_id, job.channel_id, entry)?;
+    metrics.record_transcription_line();
     Ok(())
 }
 
