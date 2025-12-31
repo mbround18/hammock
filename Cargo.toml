@@ -43,7 +43,7 @@ whisper-rs-sys = { path = "vendor/whisper-rs-sys" }
 poise = "0.6.1"
 dotenvy = "0.15.7"
 which = "8.0.0"
-reqwest = { version = "0.12.24", default-features = false, features = [
+reqwest = { version = "0.13.0", default-features = false, features = [
     "rustls-tls",
     "stream",
     "multipart",
