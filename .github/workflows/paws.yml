@@ -45,7 +45,14 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked --verbose
 
-      - run: paws ci --toolchain python
+      # Not `paws ci --toolchain python`: that pipeline is for a Python
+      # distribution, and this repo is not one. pyproject.toml exists only to
+      # pin openai-whisper into the runtime venv, so `uv build` packages the
+      # Rust src/ tree into a meaningless wheel and `uv run pytest` fails —
+      # there is no pytest and no Python test suite to run. Lockfile agreement
+      # is the real gate; the Docker build exercises `uv sync --locked` for
+      # actual installability.
+      - run: uv lock --check
 
       # Pushes on a push to main or a tag; other builds are build-only unless
       # the PR carries the `canary` label.
