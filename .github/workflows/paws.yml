@@ -28,7 +28,23 @@ jobs:
         with:
           enable-cache: true
 
-      - run: paws ci --toolchain rust
+      # `paws ci --toolchain rust` runs in a bare rust:1-bookworm container with
+      # no system packages, so it cannot build this project: libopus_sys and
+      # whisper-rs-sys need cmake, clang and pkg-config — the same packages this
+      # repo's own Dockerfile installs. paws exposes no way for a consumer repo
+      # to add them (its --coverage builder image doesn't carry them either), so
+      # the Rust gates run natively here. Same four checks paws would have run,
+      # plus --locked.
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev clang libclang-dev cmake
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked --verbose
+
       - run: paws ci --toolchain python
 
       # Pushes on a push to main or a tag; other builds are build-only unless
