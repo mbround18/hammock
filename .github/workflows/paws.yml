@@ -18,12 +18,12 @@ jobs:
       - uses: actions/checkout@v7
 
       - uses: mbround18/paws/actions/paws-up@main
+        with:
+          version: v0.0.1-prerelease.43
 
-      # `paws ci` provisions a host toolchain for every ecosystem it detects in
-      # the repo, not just --toolchain's. This repo has a pyproject.toml, so the
-      # rust build also provisions python, which shells out to `uv`. The runner
-      # ships rustup but not uv, so without this every `paws ci` step fails
-      # before it starts.
+      # `paws ci --toolchain python` provisions python by shelling out to `uv`,
+      # and the runner does not ship it. paws cannot bootstrap uv itself — it
+      # uses uv to install a python version, so uv has to already exist.
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
