@@ -19,6 +19,15 @@ jobs:
 
       - uses: mbround18/paws/actions/paws-up@main
 
+      # `paws ci` provisions a host toolchain for every ecosystem it detects in
+      # the repo, not just --toolchain's. This repo has a pyproject.toml, so the
+      # rust build also provisions python, which shells out to `uv`. The runner
+      # ships rustup but not uv, so without this every `paws ci` step fails
+      # before it starts.
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
       - run: paws ci --toolchain rust
       - run: paws ci --toolchain python
 
