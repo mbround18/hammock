@@ -33,16 +33,16 @@ jobs:
 
       # Pushes on a push to main or a tag; other builds are build-only unless
       # the PR carries the `canary` label.
-      - name: Collect PR labels
-        if: github.event_name == 'pull_request'
-        run: echo "PAWS_PR_LABELS=${{ join(github.event.pull_request.labels.*.name, ',') }}" >> "$GITHUB_ENV"
-
+      #
+      # PR label names are attacker-controlled on a fork PR, so they reach the
+      # command through the environment instead of being interpolated into the
+      # run script. On a non-PR event `join` yields an empty string.
       - run: >
           paws docker
           --image ghcr.io/mbround18/hammock
           --with-latest --tag-rollup --tag-branch --tag-pr
-          --labels "${PAWS_PR_LABELS}"
+          --labels "$PAWS_PR_LABELS"
         env:
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ github.token }}
-          PAWS_PR_LABELS: ""
+          PAWS_PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
