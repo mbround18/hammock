@@ -47,7 +47,10 @@ use serenity::{
 };
 use songbird::{
     Call, Config as SongbirdConfig, SerenityInit,
-    driver::{Channels as DecodeChannels, CryptoMode, DecodeMode, SampleRate as DecodeSampleRate},
+    driver::{
+        Channels as DecodeChannels, CryptoMode, DecodeConfig, DecodeMode,
+        SampleRate as DecodeSampleRate,
+    },
     events::{Event, EventContext, EventHandler, TrackEvent},
     input::File as SongbirdFile,
 };
@@ -327,17 +330,25 @@ async fn main() -> anyhow::Result<()> {
 
     let songbird_config = SongbirdConfig::default()
         .crypto_mode(CryptoMode::XChaCha20Poly1305)
-        .decode_mode(DecodeMode::Decode)
-        .decode_sample_rate(sample_rate_from(config.sample_rate))
-        .decode_channels(DecodeChannels::Mono);
+        .decode_mode(DecodeMode::Decode(DecodeConfig::new(
+            DecodeChannels::Mono,
+            sample_rate_from(config.sample_rate),
+        )));
 
     let framework = poise::Framework::builder()
         .options(FrameworkOptions {
             commands: vec![join(), leave(), ping()],
-            event_handler: |ctx, event, _framework, data| {
+            event_handler: |framework, event| {
                 Box::pin(async move {
                     if let serenity::FullEvent::VoiceStateUpdate { old, new } = event {
-                        data.handle_voice_state_update(ctx, old.as_ref(), new).await;
+                        framework
+                            .user_data
+                            .handle_voice_state_update(
+                                framework.serenity_context,
+                                old.as_ref(),
+                                new,
+                            )
+                            .await;
                     }
                     Ok(())
                 })

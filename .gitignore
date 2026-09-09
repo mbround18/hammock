@@ -3,3 +3,4 @@
 /models
 /captions
 .venv/
+.claude/

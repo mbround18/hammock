@@ -68,8 +68,15 @@ USER bot
 
 COPY --chown=bot:bot pyproject.toml uv.lock ./
 
-RUN --mount=type=cache,target=${APP_HOME}/.cache/uv,uid=${BOT_UID},gid=${BOT_GID} \
-    uv python install 3.13 \
+# No `--mount=type=cache` here. An ownership-scoped cache mount (uid=/gid=,
+# needed because this runs as `bot`) makes BuildKit emit a `file.mkdir` op
+# without makeParents, which Dagger's Dockerfile converter cannot represent:
+# "llbtodagger: unsupported op file.mkdir". That breaks `paws docker`, which
+# builds through Dagger. Cache mounts never become part of the image, so
+# dropping it changes nothing about the result — it only forgoes partial uv
+# download reuse on builds where uv.lock itself changed. Any build where the
+# lockfile is unchanged still hits the layer cache for this whole step.
+RUN uv python install 3.13 \
     && uv python pin 3.13 \
     && uv sync --locked
 
