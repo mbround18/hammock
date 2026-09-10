@@ -20,3 +20,25 @@ services:
     volumes:
       - ./captions:/app/captions
       - ./models:/app/models
+    # --- GPU acceleration (optional) ---
+    #
+    # Uncomment to give the container a GPU. Two things must both be true or the
+    # bot will start, warn that no device was found, and transcribe on the CPU:
+    #
+    #   1. The image must be the accelerated variant. Either set
+    #      VERSION=cuda-runtime-latest and pull
+    #      ghcr.io/mbround18/hammock:cuda-runtime-latest, or build it locally by
+    #      adding `target: cuda-runtime` to the `build:` block above. The
+    #      unprefixed tags are CPU-only builds with no GPU support compiled in.
+    #   2. The host must have an NVIDIA driver and the NVIDIA Container Toolkit
+    #      installed. The image ships neither and cannot.
+    #
+    # See docs/GPU.md.
+    #
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1        # or: device_ids: ["0"] to pin a specific GPU
+    #           capabilities: [gpu]

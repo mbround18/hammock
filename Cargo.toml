@@ -60,6 +60,12 @@ actix-web = { version = "4.15.0", default-features = false, features = [
     "macros",
 ] }
 
+[dev-dependencies]
+# The fixture harness round-trips audio through Opus so it measures the codec
+# path Discord actually imposes. Same crate songbird already links, so this
+# adds no new native build.
+opus2 = "0.4.0"
+
 [features]
 default = []
 cuda = ["whisper-rs/cuda"]

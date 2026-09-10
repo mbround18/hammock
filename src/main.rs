@@ -65,9 +65,8 @@ const INVITE_SCOPES: &str = "bot%20applications.commands";
 const ENTRY_SOUND_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct BotState {
-    chunk_samples: usize,
+    segmentation: voice::segmenter::SegmentationConfig,
     sample_rate: u32,
-    chunk_duration: Duration,
     transcriber: TranscriptionHandle,
     speaker_updates: SpeakerUpdateSender,
     caption_sink: Arc<CaptionSink>,
@@ -76,14 +75,17 @@ pub struct BotState {
     summarizer: Option<OpenAiSummarizer>,
     include_transcripts_with_summary: bool,
     active_calls: DashMap<GuildId, ChannelId>,
+    /// Live caption pipelines, so buffered audio can be flushed when the bot
+    /// leaves a channel or shuts down (FR-007). Without a handle here, nothing
+    /// could reach the buffers before the call was torn down.
+    pipelines: DashMap<GuildId, Arc<voice::AudioAggregator>>,
     voice_rosters: DashMap<GuildId, Arc<VoiceRoster>>,
     metrics: Arc<AppMetrics>,
 }
 
 struct BotStateConfig {
-    chunk_samples: usize,
+    segmentation: voice::segmenter::SegmentationConfig,
     sample_rate: u32,
-    chunk_duration: Duration,
     transcriber: TranscriptionHandle,
     speaker_updates: SpeakerUpdateSender,
     caption_sink: Arc<CaptionSink>,
@@ -95,11 +97,27 @@ struct BotStateConfig {
 }
 
 impl BotState {
+    /// Flush and drop the caption pipeline for one guild, transcribing whatever
+    /// audio was buffered (FR-007).
+    async fn flush_pipelines(&self, guild_id: GuildId) {
+        if let Some((_, aggregator)) = self.pipelines.remove(&guild_id) {
+            aggregator.flush_all().await;
+        }
+    }
+
+    /// Flush every guild's pipeline. Used on shutdown, where there is no
+    /// `/leave` to hang the flush off.
+    async fn flush_all_pipelines(&self) {
+        let guilds: Vec<GuildId> = self.pipelines.iter().map(|entry| *entry.key()).collect();
+        for guild_id in guilds {
+            self.flush_pipelines(guild_id).await;
+        }
+    }
+
     fn new(config: BotStateConfig) -> Self {
         let BotStateConfig {
-            chunk_samples,
+            segmentation,
             sample_rate,
-            chunk_duration,
             transcriber,
             speaker_updates,
             caption_sink,
@@ -110,9 +128,8 @@ impl BotState {
             metrics,
         } = config;
         Self {
-            chunk_samples,
+            segmentation,
             sample_rate,
-            chunk_duration,
             transcriber,
             speaker_updates,
             caption_sink,
@@ -121,6 +138,7 @@ impl BotState {
             summarizer,
             include_transcripts_with_summary,
             active_calls: DashMap::new(),
+            pipelines: DashMap::new(),
             voice_rosters: DashMap::new(),
             metrics,
         }
@@ -277,14 +295,56 @@ async fn main() -> anyhow::Result<()> {
     let speaker_rx = Arc::new(StdMutex::new(Some(speaker_rx)));
     ensure_model_available(&config).await?;
     let caption_sink = Arc::new(CaptionSink::new(config.caption_dir.clone()));
-    let transcriber = spawn_worker(
+    let worker = spawn_worker(
         config.whisper_model_path.clone(),
         caption_sink.clone(),
         config.whisper_language.clone(),
         config.whisper_use_gpu,
         config.whisper_gpu_device,
+        config.transcription_concurrency,
         Arc::clone(&metrics),
     )?;
+    // FR-006: say which processor transcription is running on, and name the
+    // device when it is a GPU. Logged at info because it is the answer to the
+    // first question anyone asks when transcription is slower than expected.
+    match worker.backend.fallback_reason() {
+        None => tracing::info!(
+            backend = ?worker.backend.kind(),
+            device_index = worker.backend.device_index(),
+            device_name = worker.backend.device_name().unwrap_or("-"),
+            "transcription backend: {}",
+            worker.backend.describe()
+        ),
+        Some(reason) => tracing::info!(
+            backend = ?worker.backend.kind(),
+            fallback_reason = reason.as_str(),
+            "transcription backend: {} (GPU was requested but is unavailable; \
+             see the warning above)",
+            worker.backend.describe()
+        ),
+    }
+    // FR-012: say how many workers there are and where the number came from.
+    // "4 workers" alone does not tell an operator whether their configuration
+    // was read; the source does.
+    tracing::info!(
+        concurrency = worker.concurrency.value,
+        "transcription concurrency: {} workers ({})",
+        worker.concurrency.value,
+        worker.concurrency.source.describe()
+    );
+    // FR-010's reporting half: segmentation is now the thing that decides what
+    // a caption contains, so its settings belong next to the backend and
+    // concurrency lines rather than buried in a debug log.
+    tracing::info!(
+        silence_ms = config.utterance_silence.as_millis() as u64,
+        max_secs = config.utterance_max.as_secs(),
+        min_speech_ms = config.utterance_min_speech.as_millis() as u64,
+        "utterance segmentation: close after {}ms silence, max {}s, min speech {}ms",
+        config.utterance_silence.as_millis(),
+        config.utterance_max.as_secs(),
+        config.utterance_min_speech.as_millis()
+    );
+    let transcriber = worker.handle;
     let summarizer = config
         .openai_api_key
         .as_ref()
@@ -303,9 +363,12 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("OpenAI summaries disabled (OPENAPI_KEY not set)");
     }
     let data = Arc::new(BotState::new(BotStateConfig {
-        chunk_samples: config.chunk_samples(),
+        segmentation: voice::segmenter::SegmentationConfig {
+            silence: config.utterance_silence,
+            max_utterance: config.utterance_max,
+            min_speech: config.utterance_min_speech,
+        },
         sample_rate: config.sample_rate,
-        chunk_duration: config.chunk_duration,
         transcriber,
         speaker_updates: speaker_updates.clone(),
         caption_sink,
@@ -316,10 +379,14 @@ async fn main() -> anyhow::Result<()> {
         metrics: Arc::clone(&metrics),
     }));
 
+    // Cloned here because `data` is moved into the framework's setup closure
+    // below, and shutdown needs to reach the pipelines afterwards.
+    let shutdown_state = Arc::clone(&data);
+
     let _http_server = spawn_http_server(
         config.http_bind_addr,
         Arc::clone(&data),
-        metrics,
+        Arc::clone(&metrics),
         invite_tracker.clone(),
     )?;
 
@@ -379,9 +446,66 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("creating Discord client")?;
 
-    client.start().await.context("Discord client shutdown")?;
+    // Race the client against a shutdown signal rather than letting
+    // `client.start()` own the process until it is killed. Without this there
+    // is no point at which in-flight transcriptions can be allowed to finish,
+    // and FR-013 asks for exactly that.
+    let shard_manager = client.shard_manager.clone();
+    let drain_metrics = Arc::clone(&metrics);
+
+    tokio::select! {
+        result = client.start() => {
+            result.context("Discord client shutdown")?;
+        }
+        signal = shutdown_signal() => {
+            tracing::info!("{signal} received; shutting down");
+            shard_manager.shutdown_all().await;
+            // Order matters: flush buffered audio into the transcription queue
+            // first, then wait for the queue to drain. Draining first would
+            // wait for an empty queue and then discard the audio still sitting
+            // unsegmented in the aggregators (FR-007).
+            shutdown_state.flush_all_pipelines().await;
+            transcription::drain(&drain_metrics, transcription::SHUTDOWN_DRAIN).await;
+        }
+    }
 
     Ok(())
+}
+
+/// Resolve when the process is asked to stop.
+///
+/// SIGTERM is what a container runtime sends, and is the case that matters for
+/// the deployed artifact; Ctrl-C is for running it by hand. If the SIGTERM
+/// handler cannot be installed we still honor Ctrl-C rather than giving up on
+/// graceful shutdown entirely.
+async fn shutdown_signal() -> &'static str {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+        "SIGINT"
+    };
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = sigterm.recv() => "SIGTERM",
+                    label = ctrl_c => label,
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "could not install a SIGTERM handler; Ctrl-C still works"
+                );
+                ctrl_c.await
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    ctrl_c.await
 }
 
 #[poise::command(slash_command, guild_only)]
@@ -447,42 +571,48 @@ async fn join(
         .prepare_roster(ctx.serenity_context(), guild_id, target_channel)
         .await;
 
-    if let Err(err) = attach_caption_pipeline(
+    match attach_caption_pipeline(
         &handler_lock,
         CaptionPipelineConfig {
             guild_id,
             channel_id: target_channel,
-            chunk_samples: state.chunk_samples,
+            segmentation: state.segmentation,
             sample_rate: state.sample_rate,
             transcriber: state.transcriber.clone(),
             speaker_updates: Some(state.speaker_updates()),
             ctx: ctx.serenity_context().clone(),
             caption_sink: state.caption_sink.clone(),
-            silence_flush: state.chunk_duration,
             roster,
+            metrics: Arc::clone(&state.metrics),
         },
     )
     .await
     {
-        ctx.say(format!("Failed to arm caption pipeline: {err:?}"))
-            .await?;
-    } else {
-        state.track_call(guild_id, target_channel);
-        if let Err(err) =
-            state
-                .caption_sink
-                .start_session(guild_id, target_channel, session_title.clone())
-        {
-            tracing::error!(?err, "Failed to initialise caption session file");
-            ctx.say("Joined, but failed to prepare the caption log on disk")
+        Err(err) => {
+            ctx.say(format!("Failed to arm caption pipeline: {err:?}"))
                 .await?;
-        } else {
-            let mut response = format!("Listening in {}", target_channel.mention());
-            state.metrics.record_session_started();
-            if let Some(title) = session_title.as_ref() {
-                response.push_str(&format!(" — notes titled \"{}\"", title));
+        }
+        Ok(aggregator) => {
+            // Held so `/leave` and shutdown can flush buffered audio before the
+            // call is torn down (FR-007).
+            state.pipelines.insert(guild_id, aggregator);
+            state.track_call(guild_id, target_channel);
+            if let Err(err) =
+                state
+                    .caption_sink
+                    .start_session(guild_id, target_channel, session_title.clone())
+            {
+                tracing::error!(?err, "Failed to initialise caption session file");
+                ctx.say("Joined, but failed to prepare the caption log on disk")
+                    .await?;
+            } else {
+                let mut response = format!("Listening in {}", target_channel.mention());
+                state.metrics.record_session_started();
+                if let Some(title) = session_title.as_ref() {
+                    response.push_str(&format!(" — notes titled \"{}\"", title));
+                }
+                ctx.say(response).await?;
             }
-            ctx.say(response).await?;
         }
     }
 
@@ -571,6 +701,13 @@ async fn leave(ctx: BotContext<'_>) -> Result<(), Error> {
         return Ok(());
     };
     let manager = manager.clone();
+
+    // Flush BEFORE removing the call. `manager.remove` tears down the voice
+    // connection and its event handlers, and anything still buffered in the
+    // segmenter dies with it — up to a full utterance per speaker, silently.
+    // That was a live audio-loss bug (FR-007, SC-007), and speech-aware
+    // segmentation makes it worse because utterances are longer.
+    state.flush_pipelines(guild_id).await;
 
     match manager.remove(guild_id).await {
         Ok(_) => {

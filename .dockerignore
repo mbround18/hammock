@@ -7,6 +7,9 @@ target
 target/**
 captions
 docs
+# tests/ carries the committed audio fixture corpus (a few MB of WAV).
+# It is build-context only noise: nothing in any image stage reads it, and
+# letting it in would invalidate build cache on every fixture change.
 tests
 .DS_Store
 *.log

@@ -60,9 +60,35 @@ jobs:
       # PR label names are attacker-controlled on a fork PR, so they reach the
       # command through the environment instead of being interpolated into the
       # run script. On a non-PR event `join` yields an empty string.
-      - run: >
+      #
+      # CPU variant — the Dockerfile's default final stage. Untargeted, so its
+      # tags are unprefixed: `latest`, `sha-<sha>`, `v1.2.3`.
+      - name: Build and publish the CPU image
+        run: >
           paws docker
           --image ghcr.io/mbround18/hammock
+          --with-latest --tag-rollup --tag-branch --tag-pr
+          --labels "$PAWS_PR_LABELS"
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+          PAWS_PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+
+      # Accelerated variant. `--target cuda-runtime` selects the CUDA final
+      # stage; `--prepend-target` prefixes every tag it produces with the target
+      # name, so this publishes `cuda-runtime-latest`, `cuda-runtime-sha-<sha>`
+      # and so on. That prefix is what satisfies FR-003: a tag either starts
+      # with `cuda-runtime-` or it does not, with nothing in between to
+      # misread. See docs/GPU.md for the operator-facing version of this.
+      #
+      # Deliberately a separate step rather than a matrix: FR-004 requires that
+      # neither variant can silently stop building, and a failure in either step
+      # fails this job.
+      - name: Build and publish the accelerated (CUDA) image
+        run: >
+          paws docker
+          --image ghcr.io/mbround18/hammock
+          --target cuda-runtime --prepend-target
           --with-latest --tag-rollup --tag-branch --tag-pr
           --labels "$PAWS_PR_LABELS"
         env:

@@ -1,10 +1,6 @@
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
-use chrono::Utc;
 use dashmap::DashMap;
 use serenity::{
     model::id::{ChannelId, GuildId, UserId},
@@ -28,31 +24,37 @@ use tracing::{debug, error};
 
 use crate::{
     captions::CaptionSink,
-    transcription::{TranscriptionHandle, TranscriptionJob},
-    utils::resolve_user_name,
+    transcription::{SpeakerLabel, SubmitOutcome, TranscriptionHandle, TranscriptionJob},
+    utils::{resolve_user_name, resolve_user_name_cached},
 };
 
 pub mod roster;
+pub mod segmenter;
 
 use self::roster::VoiceRoster;
 
 pub struct CaptionPipelineConfig {
     pub guild_id: GuildId,
     pub channel_id: ChannelId,
-    pub chunk_samples: usize,
+    pub segmentation: segmenter::SegmentationConfig,
     pub sample_rate: u32,
     pub transcriber: TranscriptionHandle,
     pub speaker_updates: Option<SpeakerUpdateSender>,
     pub ctx: Context,
     pub caption_sink: Arc<CaptionSink>,
-    pub silence_flush: Duration,
     pub roster: Arc<VoiceRoster>,
+    pub metrics: Arc<crate::telemetry::AppMetrics>,
 }
 
+/// Attach the caption pipeline to a call.
+///
+/// Returns the aggregator so the caller can flush it when the bot leaves the
+/// channel or shuts down (FR-007). Previously nothing held a reference, which
+/// is why `/leave` could tear the call down with audio still buffered.
 pub async fn attach_caption_pipeline(
     call: &Arc<Mutex<Call>>,
     config: CaptionPipelineConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Arc<AudioAggregator>> {
     let guild_id = config.guild_id;
     let channel_id = config.channel_id;
 
@@ -75,7 +77,7 @@ pub async fn attach_caption_pipeline(
         .map(|e| (*e.key(), *e.value()))
         .collect();
     debug!("[DIAG] Initial SSRC map: {:?}", map_snapshot);
-    Ok(())
+    Ok(aggregator)
 }
 
 #[derive(Clone)]
@@ -103,27 +105,24 @@ impl VoiceEventHandler for CaptionReceiver {
     }
 }
 
-struct AudioAggregator {
+pub struct AudioAggregator {
     ctx: Context,
     guild_id: GuildId,
     channel_id: ChannelId,
-    chunk_samples: usize,
+    segmentation: segmenter::SegmentationConfig,
     sample_rate: u32,
     transcriber: TranscriptionHandle,
     ssrc_map: DashMap<u32, UserId>,
-    buffers: DashMap<u32, AudioBuffer>,
+    /// One segmenter per participant. Per-SSRC state is what makes FR-006
+    /// structural: two speakers share nothing, so one's pauses cannot end the
+    /// other's utterance.
+    segmenters: DashMap<u32, segmenter::Segmenter>,
     placeholder_labels: DashMap<u32, String>,
     speaker_updates: Option<SpeakerUpdateSender>,
     current_speaker: Mutex<Option<UserId>>,
     caption_sink: Arc<CaptionSink>,
-    silence_flush: Duration,
     roster: Arc<VoiceRoster>,
-}
-
-struct AudioBuffer {
-    samples: Vec<i16>,
-    speaker: SpeakerIdentity,
-    last_activity: Instant,
+    metrics: Arc<crate::telemetry::AppMetrics>,
 }
 
 impl AudioAggregator {
@@ -131,30 +130,30 @@ impl AudioAggregator {
         let CaptionPipelineConfig {
             guild_id,
             channel_id,
-            chunk_samples,
+            segmentation,
             sample_rate,
             transcriber,
             speaker_updates,
             ctx,
             caption_sink,
-            silence_flush,
             roster,
+            metrics,
         } = config;
         Self {
             ctx,
             guild_id,
             channel_id,
-            chunk_samples,
+            segmentation,
             sample_rate,
             transcriber,
             ssrc_map: DashMap::new(),
-            buffers: DashMap::new(),
+            segmenters: DashMap::new(),
             placeholder_labels: DashMap::new(),
             speaker_updates,
             current_speaker: Mutex::new(None),
             caption_sink,
-            silence_flush,
             roster,
+            metrics,
         }
     }
 
@@ -220,131 +219,150 @@ impl AudioAggregator {
     }
 
     async fn on_voice_tick(&self, tick: &VoiceTick) -> Option<Event> {
+        let now = Instant::now();
+
+        // Both halves of the tick feed the segmenter. The silent set used to be
+        // consulted only for an elapsed-time flush, but it *is* the boundary
+        // signal: Discord clients run their own voice-activity detection and
+        // stop transmitting when nobody is talking, so an SSRC's absence from
+        // `speaking` already means the sending client thinks this person
+        // stopped (research R1).
         for (ssrc, data) in &tick.speaking {
-            if let Some(decoded) = data.decoded_voice.as_ref() {
-                self.push_samples(*ssrc, decoded).await;
-            }
+            let samples = data.decoded_voice.as_deref().unwrap_or(&[]);
+            self.advance(*ssrc, true, samples, now).await;
         }
 
         for ssrc in &tick.silent {
-            self.flush_expired(*ssrc).await;
+            self.advance(*ssrc, false, &[], now).await;
         }
 
         None
     }
 
-    async fn push_samples(&self, ssrc: u32, samples: &[i16]) {
+    /// Advance one participant's segmenter by a tick, dispatching whatever
+    /// utterance it closes.
+    async fn advance(&self, ssrc: u32, speaking: bool, samples: &[i16], now: Instant) {
+        // Only open a segmenter for a participant we have actually heard from.
+        // A silent tick for a stranger is not worth an allocation, and every
+        // SSRC in the channel produces one every 20 ms.
+        if !speaking && !self.segmenters.contains_key(&ssrc) {
+            return;
+        }
+
         let identity = self.resolve_identity(ssrc, None).await;
-        self.consume_samples(ssrc, identity, samples).await;
-    }
 
-    async fn consume_samples(&self, ssrc: u32, identity: SpeakerIdentity, samples: &[i16]) {
-        if samples.is_empty() {
-            return;
-        }
-
-        debug!(
-            "[AUDIO] Received {} samples for ssrc {}",
-            samples.len(),
-            ssrc
-        );
-        let mut chunks = Vec::new();
-        {
-            let mut entry = self
-                .buffers
+        let closed = {
+            let mut segmenter = self
+                .segmenters
                 .entry(ssrc)
-                .or_insert_with(|| AudioBuffer::new(identity.clone()));
+                .or_insert_with(|| segmenter::Segmenter::new(self.segmentation, self.sample_rate));
+            segmenter.on_tick(speaking, samples, &identity, now)
+        };
 
-            entry.speaker = identity.clone();
-            entry.samples.extend_from_slice(samples);
-            entry.last_activity = Instant::now();
-
-            while entry.samples.len() >= self.chunk_samples {
-                let chunk: Vec<i16> = entry.samples.drain(..self.chunk_samples).collect();
-                debug!(
-                    "[AUDIO] Chunk ready for transcription: {} samples for ssrc {}",
-                    chunk.len(),
-                    ssrc
-                );
-                chunks.push(chunk);
-            }
-        }
-
-        for chunk in chunks {
-            self.dispatch_chunk(identity.clone(), chunk).await;
+        if let Some(utterance) = closed {
+            self.dispatch_utterance(utterance).await;
         }
     }
 
-    async fn dispatch_chunk(&self, identity: SpeakerIdentity, samples: Vec<i16>) {
-        if samples.is_empty() {
-            debug!("[TRANSCRIBE] Empty chunk, skipping");
+    async fn dispatch_utterance(&self, utterance: segmenter::Utterance) {
+        if utterance.samples.is_empty() {
             return;
         }
 
-        debug!("[TRANSCRIBE] Dispatching chunk: {} samples", samples.len());
+        let audio_len = utterance.audio_duration(self.sample_rate);
+        debug!(
+            "[TRANSCRIBE] Utterance closed: {} samples ({:.2}s audio, {:.2}s speech)",
+            utterance.samples.len(),
+            audio_len.as_secs_f32(),
+            utterance.speech_duration().as_secs_f32(),
+        );
+        // FR-011. The shape of this distribution is how an operator sees that
+        // segmentation is misconfigured — a median collapsing toward the
+        // minimum means the silence threshold is too low.
+        self.metrics.record_utterance_length(audio_len);
 
-        let (speaker_id, speaker_name) = match identity.clone() {
+        let (speaker_id, speaker) = match utterance.speaker.clone() {
             SpeakerIdentity::Known(user_id) => {
                 self.set_current_speaker(user_id).await;
-                let name = resolve_user_name(&self.ctx, user_id).await;
-                (Some(user_id), name)
+                // A cache hit costs nothing and can stay here. A miss would be
+                // an HTTP round trip, and this runs inside the 20 ms voice tick
+                // handler, where Constitution Principle I forbids awaiting a
+                // network call — so a miss is deferred to the dispatcher
+                // instead, which resolves it off this path.
+                let label = match resolve_user_name_cached(&self.ctx, user_id) {
+                    Some(name) => SpeakerLabel::Resolved(name),
+                    None => SpeakerLabel::Deferred {
+                        user_id,
+                        ctx: self.ctx.clone(),
+                    },
+                };
+                (Some(user_id), label)
             }
-            SpeakerIdentity::Placeholder { label } => (None, label),
+            SpeakerIdentity::Placeholder { label } => (None, SpeakerLabel::Resolved(label)),
         };
 
         let job = TranscriptionJob {
             channel_id: self.channel_id,
             guild_id: self.guild_id,
             speaker_id,
-            speaker_name,
-            pcm: samples,
+            speaker,
+            pcm: utterance.samples,
             sample_rate: self.sample_rate,
-            started_at: Utc::now(),
+            // FR-014: when the speech began, not when the segment closed or
+            // when transcription happened to start. The previous code stamped
+            // `Utc::now()` here, which was never a record of when anyone spoke.
+            started_at: utterance.started_at,
+            queued_at: None,
         };
 
         if let Some(user_id) = job.speaker_id {
             self.roster.note_spoke(user_id).await;
         }
 
-        let speaker_id = job.speaker_id;
-        if let Err(err) = self.transcriber.submit(job).await {
-            error!("[TRANSCRIBE] failed to queue transcription: {err:?}");
-        } else {
-            debug!(
+        // Not awaited, and that is the point: submission is synchronous, so a
+        // full transcription queue can no longer stall audio reception for
+        // every speaker in this channel. An overloaded transcriber now costs
+        // one dropped utterance, counted and logged at the submission site,
+        // instead of corrupting everyone's stream.
+        match self.transcriber.submit(job) {
+            SubmitOutcome::Queued => debug!(
                 "[TRANSCRIBE] Transcription job queued for user {:?}",
                 speaker_id
-            );
+            ),
+            // Both already logged with full context inside `submit`; logging
+            // again here would double-count them in an operator's eyes.
+            SubmitOutcome::Discarded | SubmitOutcome::Closed => {}
         }
     }
 
+    /// Close and dispatch a participant's open utterance, whatever its length.
+    ///
+    /// FR-007's three cases: the speaker disconnected, the bot is leaving, or
+    /// the process is shutting down. Audio buffered at those moments used to be
+    /// dropped silently — `/leave` in particular tore the call down with
+    /// nothing flushing first.
     async fn flush_stream(&self, ssrc: u32) {
-        if let Some((_, mut entry)) = self.buffers.remove(&ssrc)
-            && !entry.samples.is_empty()
-        {
-            let samples = entry.samples.split_off(0);
-            let identity = self
-                .resolve_identity(ssrc, Some(entry.speaker.clone()))
-                .await;
+        let closed = self
+            .segmenters
+            .remove(&ssrc)
+            .and_then(|(_, mut segmenter)| segmenter.flush());
+
+        if let Some(utterance) = closed {
             debug!(
                 "[AUDIO] Flushing stream for ssrc {}: {} samples",
                 ssrc,
-                samples.len(),
+                utterance.samples.len()
             );
-            self.dispatch_chunk(identity, samples).await;
+            self.dispatch_utterance(utterance).await;
         }
     }
 
-    async fn flush_expired(&self, ssrc: u32) {
-        if let Some(mut guard) = self.buffers.get_mut(&ssrc) {
-            let should_flush =
-                guard.last_activity.elapsed() > self.silence_flush && !guard.samples.is_empty();
-            if should_flush {
-                let samples = guard.samples.split_off(0);
-                let speaker = guard.speaker.clone();
-                drop(guard);
-                let identity = self.resolve_identity(ssrc, Some(speaker)).await;
-                self.dispatch_chunk(identity, samples).await;
-            }
+    /// Flush every participant. Called when the bot leaves a channel or shuts
+    /// down (FR-007, SC-007).
+    pub async fn flush_all(&self) {
+        let ssrcs: Vec<u32> = self.segmenters.iter().map(|entry| *entry.key()).collect();
+        for ssrc in ssrcs {
+            self.flush_stream(ssrc).await;
         }
     }
 
@@ -420,18 +438,8 @@ impl AudioAggregator {
     }
 }
 
-impl AudioBuffer {
-    fn new(speaker: SpeakerIdentity) -> Self {
-        Self {
-            samples: Vec::with_capacity(4096),
-            speaker,
-            last_activity: Instant::now(),
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
-enum SpeakerIdentity {
+pub enum SpeakerIdentity {
     Known(UserId),
     Placeholder { label: String },
 }

@@ -30,6 +30,7 @@ Hammock captures Discord voice chat audio, transcribes it with Whisper, and writ
 - [Privacy Notice](./PRIVACY.md)
 - [Disclaimer](./DISCLAIMER.md)
 - [Contributing](./CONTRIBUTING.md)
+- [GPU acceleration](./GPU.md)
 
 ## Prerequisites
 
@@ -49,8 +50,11 @@ Copy `.env.sample` to `.env` (or export the variables directly) and fill in the 
 | `WHISPER_MODEL_NAME`               | ❌       | `base`                                                         | Whisper model slug passed to the CLI / download URL (e.g., `small`, `medium`).                                                                                                 |
 | `WHISPER_CLI_PATH`                 | ❌       | `whisper` on `PATH`                                            | Path to a `whisper` CLI binary. Enables CLI-based downloads when the model file is missing.                                                                                    |
 | `WHISPER_LANGUAGE`                 | ❌       | Whisper auto-detect                                            | Two-letter language hint that is forwarded to `whisper_rs`.                                                                                                                    |
-| `WHISPER_USE_GPU`                  | ❌       | `true` when compiled with `--features cuda`, otherwise `false` | Toggle GPU inference. If CUDA support is missing at build time the setting is ignored.                                                                                         |
-| `WHISPER_GPU_DEVICE`               | ❌       | `0`                                                            | CUDA device index to run inference on when the GPU path is enabled.                                                                                                            |
+| `WHISPER_USE_GPU`                  | ❌       | `true` on the accelerated image, `false` on the CPU image      | Toggle GPU inference. On a CPU build this warns and continues on CPU; setting it to `false` on an accelerated build is honored silently. See [GPU acceleration](./GPU.md).      |
+| `WHISPER_GPU_DEVICE`               | ❌       | `0`                                                            | CUDA device index to run inference on when the GPU path is enabled. An index that does not exist is reported alongside the device count, and the bot continues on CPU.          |
+| `UTTERANCE_SILENCE_MS`             | ❌       | `500`                                                          | Quiet after which an utterance is closed. Range 100-5000; below 200 warns about fragmentation. See [Utterance segmentation](#utterance-segmentation).                            |
+| `UTTERANCE_MAX_SECS`               | ❌       | `20`                                                           | Longest an utterance may run before splitting. Range 1-30 — Whisper truncates beyond a 30-second window.                                                                        |
+| `UTTERANCE_MIN_SPEECH_MS`          | ❌       | `300`                                                          | Speech shorter than this is not transcribed. Range 0-5000; 0 disables.                                                                                                          |
 | `CAPTION_OUTPUT_DIR`               | ❌       | `captions/`                                                    | Root folder where JSON caption session files are written. Created on startup.                                                                                                  |
 | `CAPTION_CHUNK_SECS`               | ❌       | `3.0` (min `0.5`)                                              | Duration (seconds) of PCM buffered before each transcription job. Influences latency vs. accuracy.                                                                             |
 | `DECODE_SAMPLE_RATE`               | ❌       | `16000`                                                        | Decode sample rate requested from Songbird/Symphonia. Must match `CAPTION_CHUNK_SECS` to control chunk sample counts.                                                          |
@@ -87,7 +91,7 @@ Hammock exposes a lightweight Actix web server (default bind `0.0.0.0:8080`, con
 
 - `GET /k8s/readyz` – readiness probe (includes uptime)
 - `GET /k8s/livez` – liveness probe driven by the active guild/channel state
-- `GET /k8s/metrics` – JSON metrics payload with guild/channel counts, participant totals, and rolling transcription volumes (1h/30m/15m/5m/1m/30s)
+- `GET /k8s/metrics` – JSON metrics payload with guild/channel counts, participant totals, rolling transcription volumes (1h/30m/15m/5m/1m/30s), error and discard counts, queue depth, in-flight work, transcription duration percentiles, and `compute_backend` (whether transcription is running on GPU or CPU, which device, and why if GPU was requested and not used — see [GPU acceleration](./GPU.md))
 - `GET /invite` – HTTP redirect to the discovered Discord invite link
 - `GET /docs` – OpenAPI document describing every endpoint
 
@@ -120,7 +124,119 @@ Set `INCLUDE_TRANSCRIPTS_WITH_SUMMARY=false` if you want to share only the AI su
 
 ### GPU acceleration
 
-Build with `cargo run --release --features cuda` to compile Whisper with cuBLAS support. With the CUDA toolkit (including `nvcc`) and NVIDIA drivers installed inside WSL or Linux, inference will automatically use the GPU. Use `WHISPER_USE_GPU=false` to fall back to CPU if the GPU stack is unavailable.
+Hammock publishes two image variants. The unprefixed tags (`latest`, `sha-…`) are the CPU build; tags prefixed `cuda-runtime-` are the accelerated build, with CUDA compiled in and the CUDA runtime present:
+
+```sh
+docker run --rm --gpus all --env-file .env -p 8080:8080 \
+  ghcr.io/mbround18/hammock:cuda-runtime-latest
+```
+
+No compilation step is needed. The host supplies the NVIDIA driver and the NVIDIA Container Toolkit; the image installs neither.
+
+Neither variant needs configuration to do the expected thing — the accelerated image uses the GPU by default, the CPU image does not look for one. If a GPU is requested and unavailable, the bot says which of four things went wrong, and transcribes on the CPU rather than failing to start.
+
+**See [GPU acceleration](./GPU.md)** for choosing a variant, granting a container GPU access, selecting among multiple GPUs, and the full fallback table.
+
+Building from source still works: `cargo build --release --features cuda`, which needs the CUDA toolkit (including `nvcc`) on the build machine.
+
+### Utterance segmentation
+
+Audio is cut where speech stops, not on a timer. Each participant's stream is
+segmented independently using the speech activity Discord already sends — a
+client stops transmitting when nobody is talking, so the bot can tell where an
+utterance ends without guessing from the audio.
+
+Three settings control it, all optional:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `UTTERANCE_SILENCE_MS` | `500` | Quiet after which an utterance closes |
+| `UTTERANCE_MAX_SECS` | `20` | Longest an utterance may run before splitting |
+| `UTTERANCE_MIN_SPEECH_MS` | `300` | Speech shorter than this is not transcribed |
+
+```text
+INFO utterance segmentation: close after 500ms silence, max 20s, min speech 300ms
+```
+
+`UTTERANCE_SILENCE_MS` is the one worth understanding. Lower it and utterances
+fragment mid-sentence — a 200 ms setting splits on an ordinary breath, and word
+error rate rises. Raise it and captions lag, because the delay between someone
+finishing and their caption appearing is roughly this value plus transcription
+time. Below 200 ms the bot warns you rather than silently accepting a setting
+that undoes the feature.
+
+`UTTERANCE_MAX_SECS` is capped at 30 for a concrete reason: Whisper processes a
+fixed 30-second window per request regardless of input length, so a longer
+utterance would be truncated. It also bounds memory — 20 s of audio is about
+640 KB per speaking participant.
+
+**Silence and background noise produce no captions.** Whisper narrates non-speech
+audio rather than staying quiet — handed music it emits `(soft music)`, handed
+applause `[APPLAUSE]`. Those are the model correctly reporting that nothing was
+said, so they are discarded rather than written to the transcript. An annotation
+sitting next to real words is real speech and is kept.
+
+Buffered audio is transcribed when a speaker disconnects, when the bot leaves a
+channel, and on shutdown, so a partial sentence is not lost to a `/leave`.
+
+**`CAPTION_CHUNK_SECS` is deprecated** and no longer affects segmentation. It is
+still read, and setting it produces a startup warning so a tuned value does not
+appear to keep working when it does not.
+
+#### Reading the metrics
+
+| Reading | Meaning |
+|---|---|
+| `utterance_length_ms.p50` around 5-10 s | Healthy conversational segmentation |
+| `p50` collapsing toward `UTTERANCE_MIN_SPEECH_MS` | Silence threshold too low — utterances fragmenting |
+| `p50` pinned at `UTTERANCE_MAX_SECS` | Threshold too high, or someone transmits continuously |
+| `total_segments_rejected_as_non_speech` rising | An open microphone in a noisy room. Working as intended |
+
+Note that `total_segments_rejected_as_non_speech` and
+`total_utterances_discarded` mean different things: a rejection means the audio
+contained no speech and nothing was lost, a discard means the transcription
+queue was full and work **was** lost.
+
+### Transcription throughput
+
+Several speakers are transcribed concurrently. How many at once is set by
+`TRANSCRIPTION_CONCURRENCY`, which defaults to available cores / 4 (capped at 4)
+on CPU and 2 on GPU. The bot reports the effective value and where it came from
+at startup:
+
+```text
+INFO transcription concurrency: 4 workers (default for cpu backend, 32 cores available)
+```
+
+The CPU default divides by four because Whisper already uses up to 4 threads
+inside a single transcription — one worker per core would oversubscribe the
+machine and run slower than doing less. The GPU default is small because each
+concurrent transcription needs its own decoder state, which costs a few hundred
+megabytes for a small model and more for a large one.
+
+**When transcription cannot keep up, the bot drops work rather than stalling.**
+This matters: audio reception runs on a 20 ms clock shared by everyone in the
+channel, so waiting for a busy transcriber would lose audio for every speaker,
+including those whose captions were fine. Instead the newest utterance is
+discarded, counted, and logged with the guild, channel and speaker it belonged
+to.
+
+Whether your setting is right is answerable from `/k8s/metrics` alone:
+
+| Reading | Meaning |
+|---|---|
+| `transcription_queue_depth` near 0, `transcription_in_flight` below the limit | Spare capacity |
+| `transcription_queue_depth` near 0, `in_flight` at the limit | Saturated but keeping up |
+| `transcription_queue_depth` rising across polls, `total_utterances_discarded` flat | Falling behind, not yet losing work |
+| `total_utterances_discarded` rising | Losing work now — raise the limit, or use a smaller model |
+| `transcription_in_flight` at 0 while `queue_depth` is above 0 | The pool is stuck. That is a bug, not overload — please report it |
+
+`transcription_duration_ms` carries `p50_ms`/`p95_ms` over recent work, which is
+the fastest way to see whether a model change made transcription slower.
+
+On shutdown the bot gives in-flight transcriptions up to 10 seconds to finish
+and reports anything still outstanding, so captions lost to a restart are
+visible rather than silent.
 
 ### Logging noise
 
